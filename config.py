@@ -14,3 +14,5 @@ WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/webhook/{BOT_TOKEN}")
 PORT = int(os.environ.get("PORT", 8443))
 
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
+CONFESSION_CHANNEL_ID = int(os.environ["CONFESSION_CHANNEL_ID"])
