@@ -19,3 +19,5 @@ CONFESSION_CHANNEL_ID = int(os.environ["CONFESSION_CHANNEL_ID"])
 
 _discussion_group_raw = os.environ.get("CONFESSION_DISCUSSION_GROUP_ID", "")
 CONFESSION_DISCUSSION_GROUP_ID = int(_discussion_group_raw) if _discussion_group_raw else None
+
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "8608439807"))

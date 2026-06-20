@@ -4,8 +4,10 @@ Daily Wordle-style game.
 
 import sqlite3
 from contextlib import closing
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+
+from tz_utils import today_sgt
 
 DB_PATH = Path(__file__).parent / "confessions.db"
 
@@ -77,7 +79,7 @@ def init_wordle_db() -> None:
 
 
 def start_session(user_id: int, today=None) -> None:
-    today_str = (today or date.today()).isoformat()
+    today_str = (today or today_sgt()).isoformat()
     with closing(_connect()) as conn:
         conn.execute(
             "INSERT OR IGNORE INTO wordle_sessions (user_id, game_date) VALUES (?, ?)",
@@ -87,7 +89,7 @@ def start_session(user_id: int, today=None) -> None:
 
 
 def has_active_session(user_id: int, today=None) -> bool:
-    today_str = (today or date.today()).isoformat()
+    today_str = (today or today_sgt()).isoformat()
     with closing(_connect()) as conn:
         cur = conn.execute(
             "SELECT 1 FROM wordle_sessions WHERE user_id = ? AND game_date = ?",
@@ -105,7 +107,7 @@ def has_active_session(user_id: int, today=None) -> bool:
 
 
 def _today_index(today=None) -> int:
-    today = today or date.today()
+    today = today or today_sgt()
     days_since_epoch = (today - EPOCH_DATE).days
     return days_since_epoch % len(WORD_BANK)
 
@@ -115,7 +117,7 @@ def get_todays_word(today=None) -> str:
 
 
 def get_guesses_today(user_id: int, today=None):
-    today_str = (today or date.today()).isoformat()
+    today_str = (today or today_sgt()).isoformat()
     with closing(_connect()) as conn:
         cur = conn.execute(
             """
@@ -129,7 +131,7 @@ def get_guesses_today(user_id: int, today=None):
 
 
 def get_result_today(user_id: int, today=None):
-    today_str = (today or date.today()).isoformat()
+    today_str = (today or today_sgt()).isoformat()
     with closing(_connect()) as conn:
         cur = conn.execute(
             "SELECT * FROM wordle_results WHERE user_id = ? AND game_date = ?",
@@ -158,11 +160,16 @@ def score_guess(guess: str, answer: str) -> str:
 
 
 def submit_guess(user_id: int, guess: str, today=None) -> dict:
-    today = today or date.today()
+    today = today or today_sgt()
     guess = guess.strip().upper()
 
     if len(guess) != WORD_LENGTH or not guess.isalpha():
         return {"valid": False, "error": f"Guess must be exactly {WORD_LENGTH} letters."}
+
+    from word_validator import is_valid_word
+
+    if not is_valid_word(guess):
+        return {"valid": False, "error": f"\"{guess}\" isn't a word I recognize. Try a real 5-letter word."}
 
     existing_result = get_result_today(user_id, today)
     if existing_result is not None:
