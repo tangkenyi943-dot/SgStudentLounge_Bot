@@ -34,20 +34,15 @@ MAX_CONSECUTIVE_REPEATED_CHARS = 12
 URL_PATTERN = re.compile(r"https?://|www\.", re.IGNORECASE)
 
 
-def check_message(text: str) -> tuple[bool, str]:
+def check_message(text):
     if not text or len(text.strip()) < MIN_MESSAGE_LENGTH:
         return False, "Your confession can't be empty."
-
     if len(text) > MAX_MESSAGE_LENGTH:
-        return False, f"Confession is too long (max {MAX_MESSAGE_LENGTH} characters)."
-
+        return False, "Confession is too long (max " + str(MAX_MESSAGE_LENGTH) + " characters)."
     lowered = text.lower()
     words_in_text = set(re.findall(r"[a-z']+", lowered))
-
     if words_in_text & BLOCKED_TERMS:
         return False, "Your message contains content that isn't allowed here."
-
     if re.search(r"(.)\1{" + str(MAX_CONSECUTIVE_REPEATED_CHARS - 1) + ",}", text):
-        return False, "Message looks like spam (too many repeated characters)."
-
+        return False, "Message looks like spam, too many repeated characters."
     return True, ""

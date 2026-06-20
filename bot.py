@@ -37,6 +37,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatType
+from telegram.helpers import escape
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -53,6 +54,7 @@ from config import (
     ADMIN_USER_ID,
     BOT_TOKEN,
     CONFESSION_CHANNEL_ID,
+    CONFESSION_CHANNEL_USERNAME,
     CONFESSION_DISCUSSION_GROUP_ID,
     PORT,
     WEBHOOK_PATH,
@@ -82,6 +84,7 @@ from cotd_store import (
     get_by_post_id,
     get_confessions_ready_to_settle,
     get_my_confessions,
+    get_random_confession,
     get_todays_winner,
     increment_comment_count,
     init_cotd_db,
@@ -104,6 +107,15 @@ from fishing_game import (
 )
 from streak_store import get_streak, get_users_at_risk, init_streak_db, record_play
 from tz_utils import SGT
+from yap_store import (
+    clear_active_thread,
+    get_active_thread_id,
+    get_or_create_thread,
+    get_other_party,
+    get_thread,
+    init_yap_db,
+    set_active_thread,
+)
 from wordle_game import (
     GAME_NAME as WORDLE_GAME_NAME,
     MAX_GUESSES,
@@ -287,14 +299,40 @@ async def gossip_category_chosen(update: Update, context: ContextTypes.DEFAULT_T
     user = update.effective_user
     identity = get_identity(user.id)
     category_label = CATEGORIES.get(category_key, "")
+    bot_username = context.bot.username
 
-    post_text = (
-        f"{category_label}\n\n"
-        f"{format_identity_tag(identity)}:\n{text}"
-    )
+    # HTML-escape user-submitted text and identity fields so confession
+    # content can't break the HTML parse mode (e.g. someone typing
+    # "<script>" or "&" in their confession).
+    safe_text = escape(text)
+    safe_username = escape(identity["username"])
+
+    # The Gossip deep link doesn't need any payload — it just opens the
+    # bot's DM, same as tapping the persistent Gossip button would.
+    gossip_link = f"https://t.me/{bot_username}?start=gossip"
+
+    def build_post_text(walkie_link: str) -> str:
+        return (
+            f"{category_label}\n\n"
+            f"{identity['avatar']} <b>{safe_username}</b> #{identity['hex_id']}:\n"
+            f"{safe_text}\n\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Post ID: #{{POST_ID}}\n\n"
+            f'Spread tea ☕ → <a href="{gossip_link}">Gossip!</a>\n'
+            f'Wanna be private? → <a href="{walkie_link}">WalkieTalkie</a>\n\n'
+            f"@{CONFESSION_CHANNEL_USERNAME}"
+        )
+
+    # Send once with a placeholder WalkieTalkie link (we don't know our own
+    # message_id until after sending), then edit it in once we do.
+    placeholder_text = build_post_text("https://t.me/" + bot_username).replace("{POST_ID}", "...")
 
     try:
-        sent_message = await context.bot.send_message(chat_id=CONFESSION_CHANNEL_ID, text=post_text)
+        sent_message = await context.bot.send_message(
+            chat_id=CONFESSION_CHANNEL_ID,
+            text=placeholder_text,
+            parse_mode="HTML",
+        )
     except Exception:
         logger.exception("Failed to post confession to channel")
         await query.edit_message_text("Something went wrong posting your confession. Please try again later.")
@@ -302,9 +340,19 @@ async def gossip_category_chosen(update: Update, context: ContextTypes.DEFAULT_T
 
     post_id = track_confession(sent_message.message_id, user.id, text, category=category_key)
 
-    # Edit the category-picker message to confirm, then send the keyboard
-    # back as a separate message (inline-keyboard messages can't carry a
-    # reply keyboard themselves).
+    walkie_link = f"https://t.me/{bot_username}?start=walkie_{user.id}_{sent_message.message_id}"
+    final_text = build_post_text(walkie_link).replace("{POST_ID}", post_id)
+
+    try:
+        await context.bot.edit_message_text(
+            chat_id=CONFESSION_CHANNEL_ID,
+            message_id=sent_message.message_id,
+            text=final_text,
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.warning("Failed to finalize confession post %s with real links", post_id)
+
     await query.edit_message_text(f"Posted ✅ ({category_label})\nPost ID: #{post_id}")
     await context.bot.send_message(
         chat_id=user.id,
@@ -329,6 +377,55 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user = update.effective_user
     identity = get_identity(user.id)
 
+    # Deep-link payload from a confession post's text links — Telegram
+    # passes whatever follows ?start= as context.args[0].
+    payload = context.args[0] if context.args else None
+
+    if payload == "gossip":
+        if identity is None:
+            await update.message.reply_text(
+                "Got something to share? You'll need a username first. "
+                "Send /setusername to set one up — it only takes a moment!"
+            )
+        else:
+            await update.message.reply_text(
+                "Got something to share? Tap 🗣️ Gossip! below to get started.",
+                reply_markup=MAIN_KEYBOARD,
+            )
+        return
+
+    if payload and payload.startswith("walkie_"):
+        try:
+            _, poster_id_str, confession_message_id_str = payload.split("_")
+            poster_id = int(poster_id_str)
+            confession_message_id = int(confession_message_id_str)
+        except ValueError:
+            await update.message.reply_text("That link looks broken — please try again from the post.")
+            return
+
+        if user.id == poster_id:
+            await update.message.reply_text("That's your own confession — no need to DM yourself! 😄")
+            return
+
+        if identity is None:
+            await update.message.reply_text(
+                "You'll need a username before you can DM someone. "
+                "Send /setusername to set one up first!"
+            )
+            return
+
+        thread_id = get_or_create_thread(user.id, poster_id, confession_message_id)
+        set_active_thread(user.id, thread_id)
+        poster_identity = get_identity(poster_id)
+        poster_tag = poster_identity["username"] if poster_identity else "them"
+
+        await update.message.reply_text(
+            f"💬 You're now DMing {poster_tag} about their confession.\n"
+            "Send your message as your next text — it'll be relayed anonymously.\n"
+            "(Send /cancel to step away, or /WalkieTalkie later to come back.)"
+        )
+        return
+
     if identity is None:
         await update.message.reply_text(
             f"Hi {user.first_name}! Welcome to the confession bot 👋\n\n"
@@ -336,6 +433,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "1. Set up a username with /setusername (takes 10 seconds)\n"
             "2. Once that's done, use the menu below to post confessions, "
             "play games, and check your points\n\n"
+            "A few things worth knowing:\n"
+            "🎮 We've got Wordle (daily word game) and Fishing (catch rare fish!) "
+            "— both earn you points\n"
+            "🏆 Check /leaderboard via the Games menu to see who's on top\n"
+            "🌟 The most-reacted confession each day gets a spotlight at midnight\n\n"
             "Let's get started — send /setusername now!"
         )
     else:
@@ -357,6 +459,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Tap 🗣️ Gossip! below, write your message, then pick a category. "
         "It posts to the channel under your chosen name with a Post ID.\n"
         "/myconfessions — see your own posts, best-performing first\n"
+        "/random — see a random confession from the archive\n"
         "/report <post_id> — flag a confession for review\n\n"
         "🏆 Points & games\n"
         "Tap 🎮 Games below for Wordle, Fishing, and the leaderboard.\n"
@@ -379,6 +482,36 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"You're currently posting as: {format_identity_tag(identity)}\n\n"
         "Want to change it? Tap ⚙️ Change Name below, or send /setusername."
     )
+
+
+async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    confession = get_random_confession()
+    if confession is None:
+        await update.message.reply_text(
+            "No confessions posted yet! Be the first — tap 🗣️ Gossip! below."
+        )
+        return
+
+    identity = get_identity(confession["user_id"])
+    category_label = CATEGORIES.get(confession["category"], "") if confession["category"] else ""
+    post_link = f"https://t.me/{CONFESSION_CHANNEL_USERNAME}/{confession['message_id']}"
+
+    if identity:
+        safe_username = escape(identity["username"])
+        tag = f"{identity['avatar']} <b>{safe_username}</b> #{identity['hex_id']}"
+    else:
+        tag = "Anonymous"
+
+    safe_text = escape(confession["confession_text"])
+
+    text = (
+        f"🎲 Random confession #{confession['post_id']}\n\n"
+        f"{category_label}\n\n"
+        f"{tag}:\n{safe_text}\n\n"
+        f"View original: {post_link}"
+    )
+
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def myconfessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -623,12 +756,23 @@ async def _send_wordle_status(user_id: int, context: ContextTypes.DEFAULT_TYPE, 
         )
 
 
-async def wordle_active_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def general_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /cancel while a Wordle session is active: stops "listening" for guesses
-    without forfeiting progress. The user can resume via Games > Wordle.
+    Unified /cancel: checks for an active YAP thread first (since that's
+    typically the more time-sensitive thing to step away from), then an
+    active Wordle session, otherwise reports nothing to cancel.
     """
     user_id = update.effective_user.id
+
+    if get_active_thread_id(user_id) is not None:
+        clear_active_thread(user_id)
+        await update.message.reply_text(
+            "Stepped away from that conversation. Send /WalkieTalkie anytime to "
+            "pick it back up.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
     if has_active_session(user_id):
         # We don't need a DB flag to "pause" — has_active_session already
         # reflects whether the game is unfinished. The actual behavior change
@@ -640,8 +784,9 @@ async def wordle_active_cancel(update: Update, context: ContextTypes.DEFAULT_TYP
             "to pick back up.",
             reply_markup=MAIN_KEYBOARD,
         )
-    else:
-        await update.message.reply_text("Nothing active to cancel.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    await update.message.reply_text("Nothing active to cancel.", reply_markup=MAIN_KEYBOARD)
 
 
 async def menu_button_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -687,6 +832,12 @@ async def fallback_text_handler(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     text = (update.message.text or "").strip()
+
+    active_thread_id = get_active_thread_id(user.id)
+    if active_thread_id is not None:
+        await _relay_yap_message(update, context, active_thread_id, text)
+        return
+
     looks_like_guess = len(text) == 5 and text.isalpha()
     wordle_paused = context.user_data.get("wordle_paused", False)
 
@@ -823,6 +974,162 @@ async def tank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines))
 
 
+async def gossip_from_post_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Fired when someone taps the 'Gossip' button on a confession post in the
+    channel. Conversation state is scoped per-chat, and this button lives
+    in the channel chat, not the user's private DM with the bot — so rather
+    than trying to inject them into the existing ConversationHandler (which
+    would track state against the channel, not their DM), we just nudge
+    them to continue in their own chat with the bot, where the persistent
+    keyboard and the real Gossip flow live.
+    """
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    identity = get_identity(user_id)
+
+    if identity is None:
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "Inspired to share something? You'll need a username first. "
+                    "Send /setusername to set one up — it only takes a moment!"
+                ),
+            )
+        except Exception:
+            logger.warning("Couldn't DM user %s — they may not have started the bot yet", user_id)
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="Got something to share? Tap 🗣️ Gossip! below to get started.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    except Exception:
+        logger.warning("Couldn't DM user %s — they may not have started the bot yet", user_id)
+
+
+async def yap_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fired when someone taps 'DM <username>' under a confession in the channel."""
+    query = update.callback_query
+    await query.answer()
+
+    _, poster_id_str, confession_message_id_str = query.data.split(":")
+    poster_id = int(poster_id_str)
+    confession_message_id = int(confession_message_id_str)
+    reader_id = update.effective_user.id
+
+    if reader_id == poster_id:
+        await context.bot.send_message(
+            chat_id=reader_id,
+            text="That's your own confession — no need to DM yourself! 😄",
+        )
+        return
+
+    reader_identity = get_identity(reader_id)
+    if reader_identity is None:
+        await context.bot.send_message(
+            chat_id=reader_id,
+            text=(
+                "You'll need a username before you can DM someone. "
+                "Send /setusername to set one up first!"
+            ),
+        )
+        return
+
+    thread_id = get_or_create_thread(reader_id, poster_id, confession_message_id)
+    set_active_thread(reader_id, thread_id)
+
+    poster_identity = get_identity(poster_id)
+    poster_tag = poster_identity["username"] if poster_identity else "them"
+
+    await context.bot.send_message(
+        chat_id=reader_id,
+        text=(
+            f"💬 You're now DMing {poster_tag} about their confession.\n"
+            "Send your message as your next text — it'll be relayed anonymously.\n"
+            "(Send /cancel to step away, or /WalkieTalkie later to come back.)"
+        ),
+    )
+
+
+async def yap_reply_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fired when someone taps 'Reply' under a relayed YAP message."""
+    query = update.callback_query
+    await query.answer()
+
+    thread_id = int(query.data.split(":", 1)[1])
+    user_id = update.effective_user.id
+
+    thread = get_thread(thread_id)
+    if thread is None:
+        await context.bot.send_message(chat_id=user_id, text="This conversation isn't available anymore.")
+        return
+
+    set_active_thread(user_id, thread_id)
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="💬 Send your reply as your next message.\n(Send /cancel to step away.)",
+    )
+
+
+async def walkietalkie_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually jump back into your most recently active YAP thread."""
+    user_id = update.effective_user.id
+    thread_id = get_active_thread_id(user_id)
+
+    if thread_id is None:
+        await update.message.reply_text(
+            "You don't have an active conversation right now. DM buttons on "
+            "confessions will start one!"
+        )
+        return
+
+    other_party_id = get_other_party(thread_id, user_id)
+    other_identity = get_identity(other_party_id) if other_party_id else None
+    other_tag = other_identity["username"] if other_identity else "them"
+
+    await update.message.reply_text(
+        f"📻 Back in your conversation with {other_tag}. Send your message!"
+    )
+
+
+async def _relay_yap_message(update: Update, context: ContextTypes.DEFAULT_TYPE, thread_id: int, text: str) -> None:
+    sender_id = update.effective_user.id
+    recipient_id = get_other_party(thread_id, sender_id)
+
+    if recipient_id is None:
+        await update.message.reply_text("This conversation isn't available anymore.")
+        return
+
+    sender_identity = get_identity(sender_id)
+    sender_tag = sender_identity["username"] if sender_identity else "Someone"
+
+    reply_keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("↩️ Reply", callback_data=f"yap_reply:{thread_id}")]]
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=recipient_id,
+            text=f"🗣️ {sender_tag} says:\n{text}",
+            reply_markup=reply_keyboard,
+        )
+    except Exception:
+        logger.warning("Failed to relay YAP message to user %s", recipient_id)
+        await update.message.reply_text(
+            "Couldn't deliver that — they may have blocked the bot."
+        )
+        return
+
+    set_active_thread(sender_id, thread_id)
+    await update.message.reply_text("Sent ✅")
+
+
 async def reaction_update_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reaction_update = update.message_reaction_count
     if reaction_update is None:
@@ -864,18 +1171,27 @@ async def confession_of_the_day_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     identity = get_identity(winner["user_id"])
-    tag = format_identity_tag(identity) if identity else "Anonymous"
     category_label = CATEGORIES.get(winner["category"], "") if winner["category"] else ""
+
+    if identity:
+        safe_username = escape(identity["username"])
+        tag = f"{identity['avatar']} <b>{safe_username}</b> #{identity['hex_id']}"
+    else:
+        tag = "Anonymous"
+
+    safe_text = escape(winner["confession_text"])
 
     text = (
         "🌟 Confession of the Day 🌟\n\n"
         f"{category_label}\n\n"
-        f"{tag}:\n{winner['confession_text']}\n\n"
+        f"{tag}:\n{safe_text}\n\n"
         f"({winner['reaction_count']} reactions, {winner['comment_count']} comments)"
     )
 
     try:
-        await context.bot.send_message(chat_id=CONFESSION_CHANNEL_ID, text=text)
+        await context.bot.send_message(
+            chat_id=CONFESSION_CHANNEL_ID, text=text, parse_mode="HTML"
+        )
     except Exception:
         logger.exception("Failed to post confession of the day")
 
@@ -919,6 +1235,7 @@ def build_application() -> Application:
     init_fishing_db()
     init_streak_db()
     init_reports_db()
+    init_yap_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -965,7 +1282,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("whoami", whoami_command))
     app.add_handler(CommandHandler("myconfessions", myconfessions_command))
-    app.add_handler(CommandHandler("cancel", wordle_active_cancel))
+    app.add_handler(CommandHandler("random", random_command))
+    app.add_handler(CommandHandler("WalkieTalkie", walkietalkie_command))
+    app.add_handler(CommandHandler("cancel", general_cancel))
 
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_GAMES}$"), games_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_MYPOINTS}$"), mypoints_button))
@@ -977,6 +1296,9 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("resolve", resolve_command))
 
     app.add_handler(CallbackQueryHandler(games_menu_choice, pattern=r"^game:"))
+    app.add_handler(CallbackQueryHandler(gossip_from_post_callback, pattern=r"^gossip_from_post$"))
+    app.add_handler(CallbackQueryHandler(yap_start_callback, pattern=r"^yap_start:"))
+    app.add_handler(CallbackQueryHandler(yap_reply_callback, pattern=r"^yap_reply:"))
 
     # Catch-all for plain text: Wordle guesses or a hint, depending on state.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text_handler))

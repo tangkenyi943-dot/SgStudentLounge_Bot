@@ -1,6 +1,5 @@
 """
-Confession of the Day, plus Post ID + category tracking, rate limiting,
-and reaction-points settlement.
+Confession of the Day, plus Post ID + category tracking for confessions.
 """
 
 import secrets
@@ -9,9 +8,11 @@ from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from config import DB_DIR
+
 from tz_utils import now_sgt, today_sgt
 
-DB_PATH = Path(__file__).parent / "confessions.db"
+DB_PATH = Path(DB_DIR) / "confessions.db"
 
 CATEGORIES = {
     "rant": "😤 Rant",
@@ -50,6 +51,7 @@ def init_cotd_db() -> None:
 
 
 def _generate_post_id() -> str:
+    """8-character uppercase alphanumeric Post ID, e.g. CYSHDZ4Y."""
     return secrets.token_hex(4).upper()
 
 
@@ -64,7 +66,7 @@ def _unique_post_id(conn) -> str:
     raise RuntimeError("Could not generate a unique Post ID after 10 attempts")
 
 
-def get_by_post_id(post_id: str):
+def get_by_post_id(post_id: str) -> sqlite3.Row | None:
     with closing(_connect()) as conn:
         cur = conn.execute(
             "SELECT * FROM tracked_confessions WHERE post_id = ?", (post_id.strip().upper(),)
@@ -72,7 +74,11 @@ def get_by_post_id(post_id: str):
         return cur.fetchone()
 
 
-def get_my_confessions(user_id: int, limit: int = 10):
+def get_my_confessions(user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+    """
+    Returns this user's own posted confessions, most-reacted-to first.
+    Used for letting someone browse which of their own posts landed well.
+    """
     with closing(_connect()) as conn:
         cur = conn.execute(
             """
@@ -87,9 +93,19 @@ def get_my_confessions(user_id: int, limit: int = 10):
         return cur.fetchall()
 
 
+def get_random_confession() -> sqlite3.Row | None:
+    """Returns one genuinely random confession from all-time, or None if there are none yet."""
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "SELECT * FROM tracked_confessions ORDER BY RANDOM() LIMIT 1"
+        )
+        return cur.fetchone()
+
+
 def track_confession(
     message_id: int, user_id: int, text: str, category: str | None = None, today: date | None = None
 ) -> str:
+    """Call this right after posting a confession to the channel. Returns the generated Post ID."""
     now = now_sgt()
     today_str = (today or now.date()).isoformat()
     with closing(_connect()) as conn:
@@ -111,6 +127,11 @@ CONFESSION_RATE_LIMIT_MINUTES = 30
 
 
 def check_confession_rate_limit(user_id: int) -> tuple[bool, int]:
+    """
+    Returns (is_allowed, minutes_until_next_slot). is_allowed is False if
+    the user has already posted CONFESSION_RATE_LIMIT_COUNT confessions
+    within the last CONFESSION_RATE_LIMIT_MINUTES minutes.
+    """
     cutoff = (now_sgt() - timedelta(minutes=CONFESSION_RATE_LIMIT_MINUTES)).isoformat()
     with closing(_connect()) as conn:
         cur = conn.execute(
@@ -133,6 +154,7 @@ def check_confession_rate_limit(user_id: int) -> tuple[bool, int]:
 
 
 def update_reaction_count(message_id: int, new_total: int) -> None:
+    """Call this whenever a message_reaction_count update fires for a tracked message."""
     with closing(_connect()) as conn:
         conn.execute(
             "UPDATE tracked_confessions SET reaction_count = ? WHERE message_id = ?",
@@ -142,6 +164,7 @@ def update_reaction_count(message_id: int, new_total: int) -> None:
 
 
 def increment_comment_count(channel_message_id: int) -> None:
+    """Call this whenever a new comment arrives in the discussion group for a tracked post."""
     with closing(_connect()) as conn:
         conn.execute(
             "UPDATE tracked_confessions SET comment_count = comment_count + 1 WHERE message_id = ?",
@@ -158,7 +181,12 @@ def is_tracked(message_id: int) -> bool:
         return cur.fetchone() is not None
 
 
-def get_todays_winner(today: date | None = None):
+def get_todays_winner(today: date | None = None) -> sqlite3.Row | None:
+    """
+    Returns the tracked confession from today with the highest combined
+    score (reactions + comments, valued equally), or None if there were
+    no confessions today.
+    """
     today_str = (today or today_sgt()).isoformat()
     with closing(_connect()) as conn:
         cur = conn.execute(
@@ -178,7 +206,14 @@ REACTION_POINTS_MULTIPLIER = 2
 REACTION_POINTS_DELAY_MINUTES = 60
 
 
-def get_confessions_ready_to_settle():
+def get_confessions_ready_to_settle() -> list[sqlite3.Row]:
+    """
+    Returns confessions posted >= REACTION_POINTS_DELAY_MINUTES ago that
+    haven't had their reaction-based points awarded yet. Call this from a
+    periodic job; award points based on whatever reaction_count has
+    accumulated by the time this runs, then call mark_points_settled() for
+    each one so they're never paid out twice.
+    """
     cutoff = (now_sgt() - timedelta(minutes=REACTION_POINTS_DELAY_MINUTES)).isoformat()
     with closing(_connect()) as conn:
         cur = conn.execute(

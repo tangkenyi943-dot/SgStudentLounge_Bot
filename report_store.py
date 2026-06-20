@@ -6,9 +6,11 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from config import DB_DIR
+
 from tz_utils import now_sgt
 
-DB_PATH = Path(__file__).parent / "confessions.db"
+DB_PATH = Path(DB_DIR) / "confessions.db"
 
 
 def _connect():

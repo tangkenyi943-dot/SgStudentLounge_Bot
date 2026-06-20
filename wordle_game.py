@@ -7,9 +7,11 @@ from contextlib import closing
 from datetime import date, timedelta
 from pathlib import Path
 
+from config import DB_DIR
+
 from tz_utils import today_sgt
 
-DB_PATH = Path(__file__).parent / "confessions.db"
+DB_PATH = Path(DB_DIR) / "confessions.db"
 
 WORD_LENGTH = 5
 MAX_GUESSES = 6

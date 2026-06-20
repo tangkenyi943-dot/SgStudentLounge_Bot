@@ -8,9 +8,11 @@ from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from config import DB_DIR
+
 from tz_utils import now_sgt, today_sgt
 
-DB_PATH = Path(__file__).parent / "confessions.db"
+DB_PATH = Path(DB_DIR) / "confessions.db"
 MEDIA_DIR = Path(__file__).parent / "media" / "fish"
 
 GAME_NAME = "fishing"

@@ -1,12 +1,26 @@
 """
 Points and leaderboard system.
+
+Designed to be game-agnostic: any game module just calls award_points()
+with a game name, and this module handles all storage, totals, and
+leaderboard queries. Games don't need to know anything about SQL or how
+points are stored — they just report outcomes.
+
+Schema:
+  game_points(user_id, game, points) — one row per (user, game) pair,
+  points accumulate via upsert. Global total is always computed as a
+  SUM across games for a user, so there's no separate "total" column to
+  keep in sync (avoids a whole class of bugs where total drifts from
+  the sum of its parts).
 """
 
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "confessions.db"
+from config import DB_DIR
+
+DB_PATH = Path(DB_DIR) / "confessions.db"
 
 
 def _connect():
@@ -31,6 +45,10 @@ def init_points_db() -> None:
 
 
 def award_points(user_id: int, game: str, points: int) -> int:
+    """
+    Adds `points` to user's total for `game` (can be negative to deduct).
+    Returns the user's new total for that game.
+    """
     with closing(_connect()) as conn:
         conn.execute(
             """
@@ -68,7 +86,8 @@ def get_game_points(user_id: int, game: str) -> int:
         return row["points"] if row else 0
 
 
-def get_per_game_breakdown(user_id: int):
+def get_per_game_breakdown(user_id: int) -> list[sqlite3.Row]:
+    """Returns all (game, points) rows for a user, highest first."""
     with closing(_connect()) as conn:
         cur = conn.execute(
             "SELECT game, points FROM game_points WHERE user_id = ? ORDER BY points DESC",
@@ -77,7 +96,12 @@ def get_per_game_breakdown(user_id: int):
         return cur.fetchall()
 
 
-def get_global_leaderboard(limit: int = 20):
+def get_global_leaderboard(limit: int = 20) -> list[sqlite3.Row]:
+    """
+    Returns top `limit` users by global total points, joined with their
+    identity (username, avatar) for display. Users with no identity set
+    yet are excluded since there'd be nothing displayable for them.
+    """
     with closing(_connect()) as conn:
         cur = conn.execute(
             """
@@ -93,7 +117,8 @@ def get_global_leaderboard(limit: int = 20):
         return cur.fetchall()
 
 
-def get_game_leaderboard(game: str, limit: int = 20):
+def get_game_leaderboard(game: str, limit: int = 20) -> list[sqlite3.Row]:
+    """Same as get_global_leaderboard but scoped to a single game."""
     with closing(_connect()) as conn:
         cur = conn.execute(
             """
