@@ -74,6 +74,14 @@ def get_by_post_id(post_id: str) -> sqlite3.Row | None:
         return cur.fetchone()
 
 
+def get_by_message_id(message_id: int) -> sqlite3.Row | None:
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "SELECT * FROM tracked_confessions WHERE message_id = ?", (message_id,)
+        )
+        return cur.fetchone()
+
+
 def get_my_confessions(user_id: int, limit: int = 10) -> list[sqlite3.Row]:
     """
     Returns this user's own posted confessions, most-reacted-to first.
@@ -91,6 +99,15 @@ def get_my_confessions(user_id: int, limit: int = 10) -> list[sqlite3.Row]:
             (user_id, limit),
         )
         return cur.fetchall()
+
+
+def count_confessions(user_id: int) -> int:
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) AS c FROM tracked_confessions WHERE user_id = ?",
+            (user_id,),
+        )
+        return cur.fetchone()["c"]
 
 
 def get_random_confession() -> sqlite3.Row | None:

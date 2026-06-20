@@ -63,8 +63,12 @@ from config import (
 )
 from content_filter import check_message
 from identity_store import (
+    get_by_hex_id,
     get_identity,
     init_db,
+    is_banned,
+    list_all_identities,
+    set_banned,
     set_identity,
     username_taken,
     validate_username,
@@ -74,6 +78,8 @@ from points_store import (
     get_global_leaderboard,
     get_global_total,
     get_per_game_breakdown,
+    get_recent_point_events,
+    get_weekly_leaderboard,
     init_points_db,
 )
 from cotd_store import (
@@ -81,6 +87,8 @@ from cotd_store import (
     CONFESSION_RATE_LIMIT_COUNT,
     REACTION_POINTS_MULTIPLIER,
     check_confession_rate_limit,
+    count_confessions,
+    get_by_message_id,
     get_by_post_id,
     get_confessions_ready_to_settle,
     get_my_confessions,
@@ -93,6 +101,7 @@ from cotd_store import (
     track_confession,
     update_reaction_count,
 )
+from badges_store import BADGES, award_badge, get_user_badges, init_badges_db
 from report_store import add_report, get_unreviewed_reports, init_reports_db, mark_reviewed
 from fishing_game import (
     GAME_NAME as FISHING_GAME_NAME,
@@ -151,6 +160,21 @@ def format_identity_tag(identity) -> str:
     return f"{identity['avatar']} {identity['username']} #{identity['hex_id']}"
 
 
+async def _try_award_badge(context: ContextTypes.DEFAULT_TYPE, user_id: int, badge_key: str) -> None:
+    """Awards a badge if not already earned, and DMs the user if it's newly earned."""
+    newly_awarded = award_badge(user_id, badge_key)
+    if not newly_awarded:
+        return
+    emoji, name, description = BADGES[badge_key]
+    try:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"🎉 Achievement unlocked: {emoji} {name}\n{description}",
+        )
+    except Exception:
+        logger.warning("Couldn't DM badge announcement to user %s", user_id)
+
+
 def category_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         InlineKeyboardButton(label, callback_data=f"cat:{key}")
@@ -166,7 +190,8 @@ def games_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🟩 Wordle", callback_data="game:wordle")],
             [InlineKeyboardButton("🎣 Fishing", callback_data="game:fishing")],
-            [InlineKeyboardButton("🏆 Leaderboard", callback_data="game:leaderboard")],
+            [InlineKeyboardButton("🏆 All-Time Leaderboard", callback_data="game:leaderboard")],
+            [InlineKeyboardButton("📅 This Week's Leaderboard", callback_data="game:weekly_leaderboard")],
         ]
     )
 
@@ -243,6 +268,12 @@ async def gossip_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await update.message.reply_text(
             "You'll need a username first. Send /setusername to set one up — "
             "it only takes a moment!"
+        )
+        return ConversationHandler.END
+
+    if identity["banned"]:
+        await update.message.reply_text(
+            "Your account is currently restricted from posting confessions."
         )
         return ConversationHandler.END
 
@@ -340,6 +371,17 @@ async def gossip_category_chosen(update: Update, context: ContextTypes.DEFAULT_T
 
     post_id = track_confession(sent_message.message_id, user.id, text, category=category_key)
 
+    confession_count = count_confessions(user.id)
+    if confession_count == 1:
+        await _try_award_badge(context, user.id, "first_steps")
+    elif confession_count == 10:
+        await _try_award_badge(context, user.id, "storyteller")
+
+    streak_result = record_play(user.id)
+    if streak_result["milestone_hit"]:
+        bonus = streak_result["bonus_points"]
+        award_points(user.id, "confessions", bonus)
+
     walkie_link = f"https://t.me/{bot_username}?start=walkie_{user.id}_{sent_message.message_id}"
     final_text = build_post_text(walkie_link).replace("{POST_ID}", post_id)
 
@@ -353,7 +395,13 @@ async def gossip_category_chosen(update: Update, context: ContextTypes.DEFAULT_T
     except Exception:
         logger.warning("Failed to finalize confession post %s with real links", post_id)
 
-    await query.edit_message_text(f"Posted ✅ ({category_label})\nPost ID: #{post_id}")
+    streak_line = f"\n🔥 {streak_result['current_streak']}-day streak!"
+    if streak_result["milestone_hit"]:
+        streak_line += f" 🎊 {streak_result['milestone_hit']}-day milestone! +{bonus} bonus points!"
+
+    await query.edit_message_text(
+        f"Posted ✅ ({category_label})\nPost ID: #{post_id}{streak_line}"
+    )
     await context.bot.send_message(
         chat_id=user.id,
         text="What's next?",
@@ -465,8 +513,27 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Tap 🎮 Games below for Wordle, Fishing, and the leaderboard.\n"
         "/fish, /reel, /tank — cast a line, reel it in, see your collection\n"
         "📊 My Points shows your total and breakdown by game.\n\n"
+        "/rules — see community guidelines anytime\n\n"
         "Your real Telegram account is never shown publicly — only your "
         "chosen username, avatar, and a random ID number."
+    )
+
+
+async def rules_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "👋 Welcome to SgStudentLounge!\n\n"
+        "This is your space to confess, vent, and connect - completely anonymous, "
+        "but never sketchy. Here's how it works:\n\n"
+        "🗣️ Want to share something? DM @SgStudentLounge_Bot and tap Gossip! - "
+        "pick a username once, then post under that name forever. Nobody sees "
+        "your real identity, just your chosen name + a unique ID.\n\n"
+        "📌 Categories: 😤 Rant · 💕 Love · 🆘 Help · 📚 Study · ⚖️ Debate\n\n"
+        "🎮 Bored? The bot's got games - Wordle and Fishing, both with a points "
+        "system and leaderboard. Check /mypoints and /leaderboard.\n\n"
+        "🌟 Confession of the Day - the most-reacted post from each day gets a "
+        "spotlight at midnight.\n\n"
+        "🚩 See something that shouldn't be here? /report it.\n\n"
+        "This is a community thing - be kind, keep it real, and have fun. 💛"
     )
 
 
@@ -482,6 +549,27 @@ async def whoami_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"You're currently posting as: {format_identity_tag(identity)}\n\n"
         "Want to change it? Tap ⚙️ Change Name below, or send /setusername."
     )
+
+
+async def badges_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    identity = get_identity(update.effective_user.id)
+    if identity is None:
+        await update.message.reply_text(
+            "You haven't set up a username yet. Send /setusername to get started!"
+        )
+        return
+
+    earned = get_user_badges(update.effective_user.id)
+    earned_keys = {b["badge_key"] for b in earned}
+
+    lines = [f"🏆 Your achievements ({len(earned_keys)}/{len(BADGES)}):\n"]
+    for key, (emoji, name, description) in BADGES.items():
+        if key in earned_keys:
+            lines.append(f"{emoji} {name} — {description}")
+        else:
+            lines.append(f"🔒 ??? — keep playing to unlock!")
+
+    await update.message.reply_text("\n".join(lines))
 
 
 async def random_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -607,6 +695,204 @@ async def resolve_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await update.message.reply_text(f"Marked report #{context.args[0]} as reviewed.")
 
 
+PAGE_SIZE = 10
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: full list of every user, real Telegram ID alongside their pseudonym."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("This command is admin-only.")
+        return
+
+    all_users = list_all_identities()
+    if not all_users:
+        await update.message.reply_text("No users yet.")
+        return
+
+    total_pages = (len(all_users) + PAGE_SIZE - 1) // PAGE_SIZE
+
+    page = 1
+    if context.args:
+        try:
+            page = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(f"Usage: /users <page number> (1-{total_pages})")
+            return
+
+    if page < 1 or page > total_pages:
+        await update.message.reply_text(f"Page {page} doesn't exist. Valid range: 1-{total_pages}.")
+        return
+
+    start = (page - 1) * PAGE_SIZE
+    page_users = all_users[start:start + PAGE_SIZE]
+
+    lines = [f"👥 {len(all_users)} user(s) — page {page}/{total_pages}\n"]
+    for u in page_users:
+        ban_flag = " 🚫BANNED" if u["banned"] else ""
+        lines.append(f"ID {u['user_id']} → {u['avatar']} {u['username']} #{u['hex_id']}{ban_flag}")
+
+    if total_pages > 1:
+        lines.append(f"\nSee more: /users {page + 1}" if page < total_pages else "")
+
+    await update.message.reply_text("\n".join(lines).strip())
+
+
+async def whois_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: look up a specific person by their hex ID or a confession's Post ID."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("This command is admin-only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /whois <hex_id_or_post_id>")
+        return
+
+    query = context.args[0].strip().upper()
+
+    identity = get_by_hex_id(query)
+    if identity is None:
+        # Not a hex ID — maybe it's a Post ID, look up the confession's author.
+        confession = get_by_post_id(query)
+        if confession is None:
+            await update.message.reply_text(f"No match found for #{query}.")
+            return
+        identity = get_identity(confession["user_id"])
+        if identity is None:
+            await update.message.reply_text("Found the confession, but the author has no identity on record.")
+            return
+
+    ban_flag = " 🚫 BANNED" if identity["banned"] else ""
+    await update.message.reply_text(
+        f"Real Telegram ID: {identity['user_id']}\n"
+        f"Username: {identity['avatar']} {identity['username']} #{identity['hex_id']}{ban_flag}\n"
+        f"Joined: {identity['created_at']}"
+    )
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: community health snapshot."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("This command is admin-only.")
+        return
+
+    all_users = list_all_identities()
+    total_users = len(all_users)
+    banned_count = sum(1 for u in all_users if u["banned"])
+
+    await update.message.reply_text(
+        f"📊 Community stats\n\n"
+        f"Total users: {total_users}\n"
+        f"Banned: {banned_count}\n"
+    )
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: ban a user from posting confessions, by hex ID."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("This command is admin-only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /ban <hex_id>")
+        return
+
+    hex_id = context.args[0].strip().upper()
+    success = set_banned(hex_id, True)
+    if success:
+        await update.message.reply_text(f"Banned user #{hex_id} from posting confessions.")
+    else:
+        await update.message.reply_text(f"No user found with hex ID #{hex_id}.")
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: lift a ban, by hex ID."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("This command is admin-only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /unban <hex_id>")
+        return
+
+    hex_id = context.args[0].strip().upper()
+    success = set_banned(hex_id, False)
+    if success:
+        await update.message.reply_text(f"Unbanned user #{hex_id}.")
+    else:
+        await update.message.reply_text(f"No user found with hex ID #{hex_id}.")
+
+
+async def addpoints_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: manually adjust a user's points for a given game, by hex ID."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("This command is admin-only.")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text("Usage: /addpoints <hex_id> <game> <amount>")
+        return
+
+    hex_id, game, amount_str = context.args[0], context.args[1], context.args[2]
+
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        await update.message.reply_text("Amount must be a whole number (can be negative).")
+        return
+
+    identity = get_by_hex_id(hex_id)
+    if identity is None:
+        await update.message.reply_text(f"No user found with hex ID #{hex_id}.")
+        return
+
+    new_total = award_points(identity["user_id"], game, amount)
+    await update.message.reply_text(
+        f"Adjusted {identity['username']}'s {game} points by {amount:+d}. "
+        f"New {game} total: {new_total}."
+    )
+
+
+async def pointlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: recent point-earning events across everyone, newest first."""
+    if update.effective_user.id != ADMIN_USER_ID:
+        await update.message.reply_text("This command is admin-only.")
+        return
+
+    # Fetch a generous pool to paginate through in-memory. If you ever need
+    # to look further back than this, raise the limit here.
+    events = get_recent_point_events(limit=200)
+    if not events:
+        await update.message.reply_text("No point events logged yet.")
+        return
+
+    total_pages = (len(events) + PAGE_SIZE - 1) // PAGE_SIZE
+
+    page = 1
+    if context.args:
+        try:
+            page = int(context.args[0])
+        except ValueError:
+            await update.message.reply_text(f"Usage: /pointlog <page number> (1-{total_pages})")
+            return
+
+    if page < 1 or page > total_pages:
+        await update.message.reply_text(f"Page {page} doesn't exist. Valid range: 1-{total_pages}.")
+        return
+
+    start = (page - 1) * PAGE_SIZE
+    page_events = events[start:start + PAGE_SIZE]
+
+    lines = [f"🧾 Point events (newest first) — page {page}/{total_pages}\n"]
+    for e in page_events:
+        who = f"{e['avatar']} {e['username']} #{e['hex_id']}" if e["username"] else f"user {e['user_id']}"
+        lines.append(f"{e['occurred_at']} — {who}: {e['points']:+d} ({e['game']})")
+
+    if page < total_pages:
+        lines.append(f"\nSee more: /pointlog {page + 1}")
+
+    await update.message.reply_text("\n".join(lines))
+
+
 async def mypoints_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     identity = get_identity(user.id)
@@ -630,7 +916,7 @@ async def mypoints_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     streak = get_streak(user.id)
     if streak and streak["current_streak"] > 0:
-        lines.append(f"\n🔥 Wordle streak: {streak['current_streak']} day(s) (best: {streak['longest_streak']})")
+        lines.append(f"\n🔥 Streak: {streak['current_streak']} day(s) (best: {streak['longest_streak']})")
 
     await update.message.reply_text("\n".join(lines))
 
@@ -643,30 +929,48 @@ def _format_leaderboard(rows, title: str) -> str:
     medals = ["🥇", "🥈", "🥉"]
     for i, row in enumerate(rows):
         prefix = medals[i] if i < len(medals) else f"{i + 1}."
-        points = row["total"] if "total" in row.keys() else row["points"]
-        lines.append(f"{prefix} {row['avatar']} {row['username']} — {points} pts")
+        has_breakdown = "wordle_points" in row.keys()
+        if has_breakdown:
+            lines.append(
+                f"{prefix} {row['avatar']} {row['username']} — "
+                f"Total: {row['total']} | 🟩 Wordle: {row['wordle_points']} | 🎣 Fishing: {row['fishing_points']}"
+            )
+        else:
+            points = row["total"] if "total" in row.keys() else row["points"]
+            lines.append(f"{prefix} {row['avatar']} {row['username']} — {points} pts")
     return "\n".join(lines)
 
 
 async def weekly_leaderboard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    rows = get_global_leaderboard(limit=20)
-    text = _format_leaderboard(rows, "🏆 This Week's Leaderboard")
+    rows = get_weekly_leaderboard(limit=20)
+    text = _format_leaderboard(rows, "🏆 This Week's Top Players")
     try:
         await context.bot.send_message(chat_id=CONFESSION_CHANNEL_ID, text=text)
     except Exception:
         logger.exception("Failed to post weekly leaderboard to channel")
 
 
+async def periodic_leaderboard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Posts this week's leaderboard to the channel every 2 hours."""
+    rows = get_weekly_leaderboard(limit=20)
+    text = _format_leaderboard(rows, "📅 This Week's Leaderboard")
+    try:
+        await context.bot.send_message(chat_id=CONFESSION_CHANNEL_ID, text=text)
+    except Exception:
+        logger.exception("Failed to post periodic leaderboard to channel")
+
+
 async def streak_warning_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Daily DM to anyone whose streak will break if they don't play today."""
+    """Daily DM to anyone whose streak will break if they don't do something today."""
     at_risk = get_users_at_risk()
     for row in at_risk:
         try:
             await context.bot.send_message(
                 chat_id=row["user_id"],
                 text=(
-                    f"🔥 Your {row['current_streak']}-day Wordle streak is about to "
-                    "end! Tap 🎮 Games > Wordle before midnight to keep it alive."
+                    f"🔥 Your {row['current_streak']}-day streak is about to end! "
+                    "Play Wordle, go fishing, or post a confession before midnight "
+                    "to keep it alive."
                 ),
             )
         except Exception:
@@ -691,7 +995,13 @@ async def games_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     if choice == "leaderboard":
         rows = get_global_leaderboard(limit=20)
-        text = _format_leaderboard(rows, "🏆 Global Leaderboard (Top 20)")
+        text = _format_leaderboard(rows, "🏆 All-Time Leaderboard (Top 20)")
+        await query.edit_message_text(text)
+        return
+
+    if choice == "weekly_leaderboard":
+        rows = get_weekly_leaderboard(limit=20)
+        text = _format_leaderboard(rows, "📅 This Week's Leaderboard (Top 20)")
         await query.edit_message_text(text)
         return
 
@@ -868,12 +1178,20 @@ async def _handle_wordle_guess(update: Update, context: ContextTypes.DEFAULT_TYP
         lines.append(f"\n🎉 You got it in {result['guesses_used']} guess(es)! +{points} points")
         lines.append(f"Your wordle total is now {new_total} points.")
 
+        if result["guesses_used"] == 1:
+            await _try_award_badge(context, user.id, "word_wizard")
+
         streak_result = record_play(user.id)
         lines.append(f"🔥 {streak_result['current_streak']}-day streak!")
         if streak_result["milestone_hit"]:
             bonus = streak_result["bonus_points"]
             award_points(user.id, WORDLE_GAME_NAME, bonus)
             lines.append(f"🎊 {streak_result['milestone_hit']}-day milestone! +{bonus} bonus points!")
+
+        if streak_result["current_streak"] >= 5:
+            await _try_award_badge(context, user.id, "dedicated")
+        if streak_result["current_streak"] >= 50:
+            await _try_award_badge(context, user.id, "centurion")
 
         await update.message.reply_text("\n".join(lines), reply_markup=MAIN_KEYBOARD)
     elif result["game_over"]:
@@ -936,10 +1254,29 @@ async def reel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     points = result["points"]
     new_total = award_points(user.id, FISHING_GAME_NAME, points)
 
+    if result["is_new"]:
+        tank = get_tank(user.id)
+        if len(tank) == 1:
+            await _try_award_badge(context, user.id, "first_catch")
+        if len(tank) == len(FISH_CATALOG):
+            await _try_award_badge(context, user.id, "collector")
+
+    if result["rarity"] == "secret":
+        await _try_award_badge(context, user.id, "jackpot")
+
+    streak_result = record_play(user.id)
+    streak_line = f"\n🔥 {streak_result['current_streak']}-day streak!"
+    fishing_bonus_note = ""
+    if streak_result["milestone_hit"]:
+        bonus = streak_result["bonus_points"]
+        award_points(user.id, FISHING_GAME_NAME, bonus)
+        fishing_bonus_note = f" 🎊 {streak_result['milestone_hit']}-day milestone! +{bonus} bonus points!"
+
     await update.message.reply_text(
         f"{result['emoji']} You caught: {result['name']}{new_tag}\n"
         f"Rarity: {result['rarity_label']}\n"
-        f"+{points} points (total: {new_total})\n\n"
+        f"+{points} points (total: {new_total})\n"
+        f"{streak_line}{fishing_bonus_note}\n\n"
         "Use /fish to cast again, or /tank to see your collection!"
     )
 
@@ -1142,6 +1479,11 @@ async def reaction_update_handler(update: Update, context: ContextTypes.DEFAULT_
     total = sum(r.total_count for r in reaction_update.reactions)
     update_reaction_count(message_id, total)
 
+    if total >= 20:
+        confession = get_by_message_id(message_id)
+        if confession is not None:
+            await _try_award_badge(context, confession["user_id"], "viral")
+
 
 async def comment_tracking_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if CONFESSION_DISCUSSION_GROUP_ID is None:
@@ -1161,6 +1503,50 @@ async def comment_tracking_handler(update: Update, context: ContextTypes.DEFAULT
     channel_message_id = getattr(forward_origin, "message_id", None)
     if channel_message_id is None or not is_tracked(channel_message_id):
         return
+
+    commenter_id = update.effective_user.id
+    identity = get_identity(commenter_id)
+
+    if identity is None:
+        # Block the comment: delete it, count nothing, DM them to set up first.
+        try:
+            await message.delete()
+        except Exception:
+            logger.warning("Couldn't delete unidentified commenter's message in discussion group")
+        try:
+            await context.bot.send_message(
+                chat_id=commenter_id,
+                text=(
+                    "You'll need a username before commenting on confessions. "
+                    "Send /setusername to set one up, then try commenting again!"
+                ),
+            )
+        except Exception:
+            # They may not have started the bot yet — nothing more we can do here.
+            logger.warning("Couldn't DM unidentified commenter %s", commenter_id)
+        return
+
+    # Identified: repost anonymized, threaded under the same confession,
+    # then delete the original real-name comment.
+    safe_username = escape(identity["username"])
+    safe_comment = escape(message.text or "")
+    anon_text = f"{identity['avatar']} <b>{safe_username}</b> #{identity['hex_id']}:\n{safe_comment}"
+
+    try:
+        await context.bot.send_message(
+            chat_id=CONFESSION_DISCUSSION_GROUP_ID,
+            text=anon_text,
+            reply_to_message_id=replied.message_id,
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("Failed to repost anonymized comment")
+        return  # don't delete the original if the repost failed — avoid losing the comment entirely
+
+    try:
+        await message.delete()
+    except Exception:
+        logger.warning("Failed to delete original real-name comment after reposting")
 
     increment_comment_count(channel_message_id)
 
@@ -1235,6 +1621,7 @@ def build_application() -> Application:
     init_fishing_db()
     init_streak_db()
     init_reports_db()
+    init_badges_db()
     init_yap_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -1280,7 +1667,9 @@ def build_application() -> Application:
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("rules", rules_command))
     app.add_handler(CommandHandler("whoami", whoami_command))
+    app.add_handler(CommandHandler("badges", badges_command))
     app.add_handler(CommandHandler("myconfessions", myconfessions_command))
     app.add_handler(CommandHandler("random", random_command))
     app.add_handler(CommandHandler("WalkieTalkie", walkietalkie_command))
@@ -1294,6 +1683,13 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("report", report_command))
     app.add_handler(CommandHandler("reports", reports_command))
     app.add_handler(CommandHandler("resolve", resolve_command))
+    app.add_handler(CommandHandler("users", users_command))
+    app.add_handler(CommandHandler("whois", whois_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("ban", ban_command))
+    app.add_handler(CommandHandler("unban", unban_command))
+    app.add_handler(CommandHandler("addpoints", addpoints_command))
+    app.add_handler(CommandHandler("pointlog", pointlog_command))
 
     app.add_handler(CallbackQueryHandler(games_menu_choice, pattern=r"^game:"))
     app.add_handler(CallbackQueryHandler(gossip_from_post_callback, pattern=r"^gossip_from_post$"))
@@ -1332,11 +1728,11 @@ def build_application() -> Application:
         time=dt_time(hour=0, minute=0, tzinfo=SGT),
     )
 
-    # Streak warning — 9pm Singapore time, a few hours before the SGT
+    # Streak warning — 10:30pm Singapore time, shortly before the SGT
     # midnight cutoff used by Wordle/streaks.
     app.job_queue.run_daily(
         streak_warning_job,
-        time=dt_time(hour=21, minute=0, tzinfo=SGT),
+        time=dt_time(hour=22, minute=30, tzinfo=SGT),
     )
 
     # Reaction-points settlement — checks every 10 minutes for confessions
@@ -1345,6 +1741,14 @@ def build_application() -> Application:
         settle_reaction_points_job,
         interval=timedelta(minutes=10),
         first=timedelta(seconds=30),
+    )
+
+    # Periodic leaderboard — posts this week's standings to the channel
+    # every 2 hours, in addition to the dedicated Sunday-evening recap.
+    app.job_queue.run_repeating(
+        periodic_leaderboard_job,
+        interval=timedelta(hours=2),
+        first=timedelta(hours=2),
     )
 
     return app

@@ -45,7 +45,8 @@ def init_db() -> None:
                 username    TEXT NOT NULL UNIQUE,
                 avatar      TEXT NOT NULL,
                 hex_id      TEXT NOT NULL UNIQUE,
-                created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+                created_at  TEXT DEFAULT CURRENT_TIMESTAMP,
+                banned      INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -98,6 +99,39 @@ def get_identity(user_id: int) -> sqlite3.Row | None:
             "SELECT * FROM identities WHERE user_id = ?", (user_id,)
         )
         return cur.fetchone()
+
+
+def get_by_hex_id(hex_id: str) -> sqlite3.Row | None:
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "SELECT * FROM identities WHERE hex_id = ?", (hex_id.strip().upper(),)
+        )
+        return cur.fetchone()
+
+
+def is_banned(user_id: int) -> bool:
+    identity = get_identity(user_id)
+    return bool(identity and identity["banned"])
+
+
+def set_banned(hex_id: str, banned: bool) -> bool:
+    """Returns True if a matching identity was found and updated, False otherwise."""
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "UPDATE identities SET banned = ? WHERE hex_id = ?",
+            (1 if banned else 0, hex_id.strip().upper()),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def list_all_identities() -> list[sqlite3.Row]:
+    """For admin use only — returns every user's real Telegram ID alongside their pseudonym."""
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "SELECT * FROM identities ORDER BY created_at ASC"
+        )
+        return cur.fetchall()
 
 
 def username_taken(username: str, exclude_user_id: int | None = None) -> bool:
