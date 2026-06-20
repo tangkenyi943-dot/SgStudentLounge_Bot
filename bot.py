@@ -1495,6 +1495,18 @@ async def comment_tracking_handler(update: Update, context: ContextTypes.DEFAULT
     if message is None or message.reply_to_message is None:
         return
 
+    # If the comment was sent "as the group/channel" (an admin's anonymous
+    # post, identified by sender_chat rather than a real from-user), there's
+    # no individual Telegram user to look up an identity for — skip it.
+    # This is genuinely a different case from a regular subscriber's
+    # comment, which carries a real `from` user.
+    if message.sender_chat is not None:
+        logger.info("Skipping comment sent via sender_chat (anonymous admin post), nothing to anonymize")
+        return
+
+    if update.effective_user is None:
+        return
+
     replied = message.reply_to_message
     forward_origin = getattr(replied, "forward_origin", None)
     if forward_origin is None or getattr(forward_origin, "type", None) != "channel":
@@ -1549,6 +1561,21 @@ async def comment_tracking_handler(update: Update, context: ContextTypes.DEFAULT
         logger.warning("Failed to delete original real-name comment after reposting")
 
     increment_comment_count(channel_message_id)
+
+    # Notify the original poster that someone commented, unless they're
+    # commenting on their own confession (no point notifying yourself).
+    confession = get_by_message_id(channel_message_id)
+    if confession is not None and confession["user_id"] != commenter_id:
+        try:
+            await context.bot.send_message(
+                chat_id=confession["user_id"],
+                text=(
+                    f"💬 Someone commented on your confession!\n\n"
+                    f"{identity['avatar']} {identity['username']}:\n{message.text}"
+                ),
+            )
+        except Exception:
+            logger.warning("Couldn't notify poster %s about new comment", confession["user_id"])
 
 
 async def confession_of_the_day_job(context: ContextTypes.DEFAULT_TYPE) -> None:
