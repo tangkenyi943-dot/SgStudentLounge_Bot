@@ -16,3 +16,6 @@ PORT = int(os.environ.get("PORT", 8443))
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 CONFESSION_CHANNEL_ID = int(os.environ["CONFESSION_CHANNEL_ID"])
+
+_discussion_group_raw = os.environ.get("CONFESSION_DISCUSSION_GROUP_ID", "")
+CONFESSION_DISCUSSION_GROUP_ID = int(_discussion_group_raw) if _discussion_group_raw else None
