@@ -951,7 +951,7 @@ async def weekly_leaderboard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def periodic_leaderboard_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Posts this week's leaderboard to the channel every 2 hours."""
+    """Posts this week's leaderboard to the channel once daily, at midnight SGT."""
     rows = get_weekly_leaderboard(limit=20)
     text = _format_leaderboard(rows, "📅 This Week's Leaderboard")
     try:
@@ -1790,12 +1790,13 @@ def build_application() -> Application:
         first=timedelta(seconds=30),
     )
 
-    # Periodic leaderboard — posts this week's standings to the channel
-    # every 2 hours, in addition to the dedicated Sunday-evening recap.
-    app.job_queue.run_repeating(
+    # Daily leaderboard — posts this week's standings to the channel once
+    # a day at midnight SGT, in addition to the dedicated Sunday-evening
+    # recap. (Previously every 2 hours — changed to daily since the more
+    # frequent posts were too noisy for the channel.)
+    app.job_queue.run_daily(
         periodic_leaderboard_job,
-        interval=timedelta(hours=2),
-        first=timedelta(hours=2),
+        time=dt_time(hour=0, minute=0, tzinfo=SGT),
     )
 
     return app
