@@ -1486,14 +1486,21 @@ async def reaction_update_handler(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def comment_tracking_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.info("COMMENT_HANDLER: fired, chat_id=%s, expected=%s", update.effective_chat.id if update.effective_chat else None, CONFESSION_DISCUSSION_GROUP_ID)
+
     if CONFESSION_DISCUSSION_GROUP_ID is None:
+        logger.info("COMMENT_HANDLER: exiting, CONFESSION_DISCUSSION_GROUP_ID is None")
         return
     if update.effective_chat.id != CONFESSION_DISCUSSION_GROUP_ID:
+        logger.info("COMMENT_HANDLER: exiting, chat_id mismatch")
         return
 
     message = update.message
     if message is None or message.reply_to_message is None:
+        logger.info("COMMENT_HANDLER: exiting, message is None or not a reply (reply_to_message=%s)", message.reply_to_message if message else "N/A")
         return
+
+    logger.info("COMMENT_HANDLER: passed initial checks, reply_to_message_id=%s", message.reply_to_message.message_id)
 
     # If the comment was sent "as the group/channel" (an admin's anonymous
     # post, identified by sender_chat rather than a real from-user), there's
@@ -1501,21 +1508,25 @@ async def comment_tracking_handler(update: Update, context: ContextTypes.DEFAULT
     # This is genuinely a different case from a regular subscriber's
     # comment, which carries a real `from` user.
     if message.sender_chat is not None:
-        logger.info("Skipping comment sent via sender_chat (anonymous admin post), nothing to anonymize")
+        logger.info("COMMENT_HANDLER: exiting, sent via sender_chat (sender_chat.id=%s)", message.sender_chat.id)
         return
 
     if update.effective_user is None:
+        logger.info("COMMENT_HANDLER: exiting, effective_user is None")
         return
 
     replied = message.reply_to_message
     forward_origin = getattr(replied, "forward_origin", None)
     if forward_origin is None or getattr(forward_origin, "type", None) != "channel":
+        logger.info("COMMENT_HANDLER: exiting, forward_origin missing or not type=channel (forward_origin=%s)", forward_origin)
         return
 
     channel_message_id = getattr(forward_origin, "message_id", None)
     if channel_message_id is None or not is_tracked(channel_message_id):
+        logger.info("COMMENT_HANDLER: exiting, channel_message_id=%s not tracked", channel_message_id)
         return
 
+    logger.info("COMMENT_HANDLER: proceeding to anonymize for user_id=%s", update.effective_user.id)
     commenter_id = update.effective_user.id
     identity = get_identity(commenter_id)
 
