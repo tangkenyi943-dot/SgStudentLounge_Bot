@@ -1735,6 +1735,22 @@ def build_application() -> Application:
     app.add_handler(CallbackQueryHandler(yap_reply_callback, pattern=r"^yap_reply:"))
 
     # Catch-all for plain text: Wordle guesses or a hint, depending on state.
+    if CONFESSION_DISCUSSION_GROUP_ID is not None:
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CONFESSION_DISCUSSION_GROUP_ID) & filters.REPLY,
+                comment_tracking_handler,
+            )
+        )
+
+    # Catch-all for plain text DMs (Wordle guesses, YAP relay, or a hint).
+    # This MUST be registered after the discussion-group comment handler
+    # above — both match plain text messages, and PTB stops checking
+    # further handlers in the same group once one matches. Registering
+    # this first was the actual root cause of comments never reaching
+    # comment_tracking_handler at all: every comment is plain text, so it
+    # matched filters.TEXT & ~filters.COMMAND here and got swallowed
+    # before the comment handler (registered later) ever got a turn.
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback_text_handler))
 
     app.add_handler(
@@ -1743,13 +1759,6 @@ def build_application() -> Application:
             message_reaction_types=MessageReactionHandler.MESSAGE_REACTION_COUNT_UPDATED,
         )
     )
-    if CONFESSION_DISCUSSION_GROUP_ID is not None:
-        app.add_handler(
-            MessageHandler(
-                filters.Chat(chat_id=CONFESSION_DISCUSSION_GROUP_ID) & filters.REPLY,
-                comment_tracking_handler,
-            )
-        )
 
     app.add_error_handler(error_handler)
 
