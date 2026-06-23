@@ -1,4 +1,5 @@
-.env
-venv/
+confessions.db
 __pycache__/
 *.pyc
+venv/
+.env
