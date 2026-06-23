@@ -34,7 +34,7 @@ GAME_NAME = "trivia_1v1"
 DIFFICULTY_POINTS = {"easy": 2, "medium": 4, "hard": 6}
 
 ROUND_DURATION_HOURS = 24
-MAX_QUESTIONS_PER_HOUR = 5
+MAX_QUESTIONS_PER_30MIN = 5
 
 
 def _connect():
@@ -150,8 +150,8 @@ def get_active_match_for_user(user_id: int, now=None) -> sqlite3.Row | None:
         ).fetchone()
 
 
-def _questions_answered_in_last_hour(match_id: int, user_id: int, now) -> int:
-    cutoff = (now - timedelta(hours=1)).isoformat()
+def _questions_answered_in_last_30min(match_id: int, user_id: int, now) -> int:
+    cutoff = (now - timedelta(minutes=30)).isoformat()
     with closing(_connect()) as conn:
         cur = conn.execute(
             """
@@ -220,8 +220,8 @@ def start_next_question(match_id: int, user_id: int, now=None) -> dict:
     if now.isoformat() > match["ends_at"]:
         return {"ok": False, "error": "This match has ended."}
 
-    if _questions_answered_in_last_hour(match_id, user_id, now) >= MAX_QUESTIONS_PER_HOUR:
-        return {"ok": False, "error": f"You've hit the limit of {MAX_QUESTIONS_PER_HOUR} questions this hour. Try again later."}
+    if _questions_answered_in_last_30min(match_id, user_id, now) >= MAX_QUESTIONS_PER_30MIN:
+        return {"ok": False, "error": f"You've hit the limit of {MAX_QUESTIONS_PER_30MIN} questions this 30 minutes. Try again later."}
 
     # Don't hand out a new question if they already have an unanswered one pending.
     with closing(_connect()) as conn:

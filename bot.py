@@ -116,7 +116,7 @@ from fishing_game import (
     start_cast,
 )
 from streak_store import get_streak, get_users_at_risk, init_streak_db, record_play
-from tz_utils import SGT, today_sgt
+from tz_utils import SGT, now_sgt, today_sgt
 from yap_store import (
     clear_active_thread,
     get_active_thread_id,
@@ -129,17 +129,17 @@ from yap_store import (
 from rank_system import RANK_THRESHOLDS, get_rank, get_rank_sticker_filename
 from trivia_source import init_trivia_cache_db, DIFFICULTY_LABELS
 from daily_trivia import (
-    DAILY_TRIVIA_POINTS,
+    DIFFICULTY_POINTS as DAILY_TRIVIA_DIFFICULTY_POINTS,
     GAME_NAME as DAILY_TRIVIA_GAME_NAME,
-    get_or_create_todays_question,
-    get_todays_state,
+    MAX_QUESTIONS_PER_30MIN as DAILY_TRIVIA_MAX_PER_30MIN,
+    get_next_question as get_daily_trivia_question,
     init_daily_trivia_db,
     submit_answer as submit_daily_trivia_answer,
 )
 from trivia_1v1 import (
     DIFFICULTY_POINTS as TRIVIA_1V1_DIFFICULTY_POINTS,
     GAME_NAME as TRIVIA_1V1_GAME_NAME,
-    MAX_QUESTIONS_PER_HOUR as TRIVIA_1V1_MAX_PER_HOUR,
+    MAX_QUESTIONS_PER_30MIN as TRIVIA_1V1_MAX_PER_30MIN,
     ROUND_DURATION_HOURS as TRIVIA_1V1_ROUND_HOURS,
     accept_challenge as accept_1v1_challenge,
     create_challenge as create_1v1_challenge,
@@ -1087,7 +1087,7 @@ async def games_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await query.edit_message_text(
             f"⚔️ 1v1 Trivia\n\n"
             f"Challenge runs for {TRIVIA_1V1_ROUND_HOURS} hours. Answer up to "
-            f"{TRIVIA_1V1_MAX_PER_HOUR} questions per hour — most weighted points wins!\n"
+            f"{TRIVIA_1V1_MAX_PER_30MIN} questions per 30 minutes — most weighted points wins!\n"
             f"🟢 Easy = {TRIVIA_1V1_DIFFICULTY_POINTS['easy']}pts · 🟡 Medium = {TRIVIA_1V1_DIFFICULTY_POINTS['medium']}pts · 🔴 Hard = {TRIVIA_1V1_DIFFICULTY_POINTS['hard']}pts\n\n"
             f"Send /trivia1v1 to start or check your match."
         )
@@ -1319,46 +1319,30 @@ async def _handle_wordle_guess(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _send_daily_trivia_question(user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """
-    Shared helper: sends today's trivia question (or the "already answered"
-    status) to chat_id. Used by both /trivia (a real command, has
-    update.message) and the Games-menu button (a callback query, where
-    update.message is None — chat_id is passed explicitly instead so this
-    works correctly from either context).
+    Shared helper: sends the player's next trivia question (or a
+    rate-limit message) to chat_id. Used by both /trivia (a real
+    command, has update.message) and the Games-menu button (a callback
+    query, where update.message is None — chat_id is passed explicitly
+    instead so this works correctly from either context).
     """
     identity = get_identity(user_id)
     if identity is None:
         await context.bot.send_message(chat_id=chat_id, text="You'll need a username first. Send /setusername to set one up!")
         return
 
-    today_str = today_sgt().isoformat()
-
-    try:
-        q_state = get_or_create_todays_question(user_id, today_str)
-    except RuntimeError:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Couldn't fetch today's trivia question right now — please try again in a moment.",
-        )
+    result = get_daily_trivia_question(user_id, now_sgt())
+    if not result["ok"]:
+        await context.bot.send_message(chat_id=chat_id, text=result["error"])
         return
 
-    if q_state["answered"]:
-        result_line = "✅ Correct!" if q_state["was_correct"] else f"❌ Incorrect (it was: {q_state['correct_answer']})"
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"You've already answered today's trivia.\n{result_line}\n\nCome back tomorrow for a new one!",
-        )
-        return
-
-    options = q_state["options"].split("|||")
-    difficulty_label = DIFFICULTY_LABELS.get(q_state["difficulty"], q_state["difficulty"])
-
+    difficulty_label = DIFFICULTY_LABELS.get(result["difficulty"], result["difficulty"])
     keyboard = InlineKeyboardMarkup(
-        [[InlineKeyboardButton(opt, callback_data=f"trivia_answer:{opt}")] for opt in options]
+        [[InlineKeyboardButton(opt, callback_data=f"trivia_answer:{opt}")] for opt in result["options"]]
     )
 
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"🧠 Daily Trivia — {difficulty_label}\n\n{q_state['question']}",
+        text=f"🧠 {difficulty_label}\n\n{result['question']}",
         reply_markup=keyboard,
     )
 
@@ -1373,9 +1357,8 @@ async def trivia_answer_callback(update: Update, context: ContextTypes.DEFAULT_T
 
     chosen = query.data.split(":", 1)[1]
     user = update.effective_user
-    today_str = today_sgt().isoformat()
 
-    result = submit_daily_trivia_answer(user.id, today_str, chosen)
+    result = submit_daily_trivia_answer(user.id, chosen, now_sgt())
     if not result["ok"]:
         await query.edit_message_text(result["error"])
         return
@@ -1391,8 +1374,9 @@ async def trivia_answer_callback(update: Update, context: ContextTypes.DEFAULT_T
             bonus = streak_result["bonus_points"]
             award_points(user.id, DAILY_TRIVIA_GAME_NAME, bonus)
             text += f"\n🎊 {streak_result['milestone_hit']}-day milestone! +{bonus} bonus points!"
+        text += "\n\nSend /trivia for your next question!"
     else:
-        text = f"❌ Not quite — the correct answer was: {result['correct_answer']}\n\nCome back tomorrow for a new one!"
+        text = f"❌ Not quite — the correct answer was: {result['correct_answer']}\n\nSend /trivia to keep going!"
 
     await query.edit_message_text(text)
 
@@ -1424,7 +1408,7 @@ async def trivia1v1_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             f"Your score: {my_score}\nTheir score: {their_score}\n\n"
             f"Ends: {active['ends_at']}\n\n"
             f"Send /trivia1v1answer to get your next question "
-            f"(up to {TRIVIA_1V1_MAX_PER_HOUR} per hour)."
+            f"(up to {TRIVIA_1V1_MAX_PER_30MIN} per 30 minutes)."
         )
         return
 
@@ -1447,7 +1431,7 @@ async def trivia1v1_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(
         f"⚔️ 1v1 Trivia\n\n"
         f"Challenge runs for {TRIVIA_1V1_ROUND_HOURS} hours. Answer up to "
-        f"{TRIVIA_1V1_MAX_PER_HOUR} questions per hour — most weighted points wins!\n"
+        f"{TRIVIA_1V1_MAX_PER_30MIN} questions per 30 minutes — most weighted points wins!\n"
         f"🟢 Easy = {TRIVIA_1V1_DIFFICULTY_POINTS['easy']}pts · 🟡 Medium = {TRIVIA_1V1_DIFFICULTY_POINTS['medium']}pts · 🔴 Hard = {TRIVIA_1V1_DIFFICULTY_POINTS['hard']}pts",
         reply_markup=keyboard,
     )

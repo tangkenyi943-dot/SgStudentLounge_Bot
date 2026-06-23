@@ -1,24 +1,29 @@
 """
 Daily Trivia game.
 
-One question per day, random difficulty, sourced live from trivia_source
-(Open Trivia DB). Correct answer awards a flat 30 points regardless of
-difficulty (daily trivia doesn't use the difficulty-weighted scoring that
-1v1 Trivia does — see trivia_1v1.py — since it's a single one-shot
-question per day, not a volume-based competition).
+Despite the name (kept for continuity with existing commands/menus),
+this is no longer a single once-a-day question. It's now unlimited play
+throughout the day, rate-limited to 5 questions every 30 minutes — the
+same pacing as 1v1 Trivia (see trivia_1v1.py) — with the same
+difficulty-weighted scoring (Easy/Medium/Hard), since unlimited replay
+makes a flat per-answer point value unbalanced against other games.
 """
 
 import sqlite3
 from contextlib import closing
+from datetime import timedelta
 from pathlib import Path
 
 from config import DB_DIR
-from trivia_source import get_question, get_random_difficulty
+from trivia_source import DIFFICULTIES, get_question, get_random_difficulty
 
 DB_PATH = Path(DB_DIR) / "confessions.db"
 
 GAME_NAME = "daily_trivia"
-DAILY_TRIVIA_POINTS = 30
+
+DIFFICULTY_POINTS = {"easy": 2, "medium": 4, "hard": 6}
+
+MAX_QUESTIONS_PER_30MIN = 5
 
 
 def _connect():
@@ -31,93 +36,105 @@ def init_daily_trivia_db() -> None:
     with closing(_connect()) as conn:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS daily_trivia_state (
+            CREATE TABLE IF NOT EXISTS daily_trivia_answers (
+                answer_id       INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id         INTEGER NOT NULL,
-                trivia_date     TEXT NOT NULL,
+                difficulty      TEXT NOT NULL,
                 question        TEXT NOT NULL,
                 correct_answer  TEXT NOT NULL,
                 options         TEXT NOT NULL,
-                difficulty      TEXT NOT NULL,
                 answered        INTEGER NOT NULL DEFAULT 0,
                 was_correct     INTEGER,
-                PRIMARY KEY (user_id, trivia_date)
+                answered_at     TEXT
             )
             """
         )
         conn.commit()
 
 
-def get_or_create_todays_question(user_id: int, today_str: str) -> sqlite3.Row:
+def _questions_answered_in_last_30min(user_id: int, now) -> int:
+    cutoff = (now - timedelta(minutes=30)).isoformat()
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM daily_trivia_answers
+            WHERE user_id = ? AND answered_at >= ?
+            """,
+            (user_id, cutoff),
+        )
+        return cur.fetchone()["c"]
+
+
+def get_next_question(user_id: int, now) -> dict:
     """
-    Returns this user's question for today, generating a fresh one (and
-    persisting it) if they haven't started today's trivia yet. Persisting
-    per-user means everyone gets a genuinely different question each day
-    (pulled fresh from the API), rather than one shared daily question —
-    a deliberate difference from Wordle's shared-word design, chosen so
-    daily trivia doesn't get "spoiled" by someone posting the answer.
+    Returns the next question for this player, respecting the
+    5-per-30-minutes rate limit. Returns:
+    {"ok": bool, "error": str, "question": str, "options": [...], "difficulty": str}
+    If they already have an unanswered question pending, returns that
+    same one again rather than generating a new one (so re-checking
+    doesn't burn through the rate limit or orphan a question).
     """
     with closing(_connect()) as conn:
-        existing = conn.execute(
-            "SELECT * FROM daily_trivia_state WHERE user_id = ? AND trivia_date = ?",
-            (user_id, today_str),
+        pending = conn.execute(
+            "SELECT * FROM daily_trivia_answers WHERE user_id = ? AND answered = 0 ORDER BY answer_id DESC LIMIT 1",
+            (user_id,),
         ).fetchone()
-        if existing is not None:
-            return existing
+        if pending is not None:
+            options = pending["options"].split("|||")
+            return {
+                "ok": True, "error": "", "question": pending["question"],
+                "options": options, "difficulty": pending["difficulty"],
+            }
 
-        difficulty = get_random_difficulty()
-        q = get_question(difficulty)
-        if q is None:
-            raise RuntimeError("Trivia question source unavailable")
+    if _questions_answered_in_last_30min(user_id, now) >= MAX_QUESTIONS_PER_30MIN:
+        return {"ok": False, "error": f"You've hit the limit of {MAX_QUESTIONS_PER_30MIN} questions this 30 minutes. Try again later."}
 
-        options_str = "|||".join(q["options"])
+    difficulty = get_random_difficulty()
+    q = get_question(difficulty)
+    if q is None:
+        return {"ok": False, "error": "Couldn't fetch a trivia question right now — please try again in a moment."}
+
+    options_str = "|||".join(q["options"])
+    with closing(_connect()) as conn:
         conn.execute(
             """
-            INSERT INTO daily_trivia_state
-                (user_id, trivia_date, question, correct_answer, options, difficulty)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO daily_trivia_answers
+                (user_id, difficulty, question, correct_answer, options)
+            VALUES (?, ?, ?, ?, ?)
             """,
-            (user_id, today_str, q["question"], q["correct_answer"], options_str, difficulty),
+            (user_id, difficulty, q["question"], q["correct_answer"], options_str),
         )
         conn.commit()
 
-        return conn.execute(
-            "SELECT * FROM daily_trivia_state WHERE user_id = ? AND trivia_date = ?",
-            (user_id, today_str),
+    return {"ok": True, "error": "", "question": q["question"], "options": q["options"], "difficulty": difficulty}
+
+
+def submit_answer(user_id: int, chosen_answer: str, now) -> dict:
+    """
+    Records the answer to whichever question is currently pending for
+    this user. Returns:
+    {"ok": bool, "error": str, "correct": bool, "correct_answer": str,
+     "points_awarded": int, "difficulty": str}
+    """
+    with closing(_connect()) as conn:
+        pending = conn.execute(
+            "SELECT * FROM daily_trivia_answers WHERE user_id = ? AND answered = 0 ORDER BY answer_id DESC LIMIT 1",
+            (user_id,),
         ).fetchone()
 
+        if pending is None:
+            return {"ok": False, "error": "You don't have a question waiting to be answered. Send /trivia to get one!"}
 
-def get_todays_state(user_id: int, today_str: str) -> sqlite3.Row | None:
-    with closing(_connect()) as conn:
-        return conn.execute(
-            "SELECT * FROM daily_trivia_state WHERE user_id = ? AND trivia_date = ?",
-            (user_id, today_str),
-        ).fetchone()
-
-
-def submit_answer(user_id: int, today_str: str, chosen_answer: str) -> dict:
-    """
-    Records the user's answer for today. Returns:
-    {"ok": bool, "error": str, "correct": bool, "correct_answer": str, "points_awarded": int}
-    """
-    state = get_todays_state(user_id, today_str)
-    if state is None:
-        return {"ok": False, "error": "You haven't started today's trivia yet."}
-    if state["answered"]:
-        return {"ok": False, "error": "You've already answered today's trivia. Come back tomorrow!"}
-
-    is_correct = chosen_answer.strip() == state["correct_answer"].strip()
-
-    with closing(_connect()) as conn:
+        is_correct = chosen_answer.strip() == pending["correct_answer"].strip()
         conn.execute(
-            "UPDATE daily_trivia_state SET answered = 1, was_correct = ? WHERE user_id = ? AND trivia_date = ?",
-            (1 if is_correct else 0, user_id, today_str),
+            "UPDATE daily_trivia_answers SET answered = 1, was_correct = ?, answered_at = ? WHERE answer_id = ?",
+            (1 if is_correct else 0, now.isoformat(), pending["answer_id"]),
         )
         conn.commit()
 
+    points = DIFFICULTY_POINTS[pending["difficulty"]] if is_correct else 0
     return {
-        "ok": True,
-        "error": "",
-        "correct": is_correct,
-        "correct_answer": state["correct_answer"],
-        "points_awarded": DAILY_TRIVIA_POINTS if is_correct else 0,
+        "ok": True, "error": "", "correct": is_correct,
+        "correct_answer": pending["correct_answer"],
+        "points_awarded": points, "difficulty": pending["difficulty"],
     }
