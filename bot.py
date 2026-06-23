@@ -27,6 +27,7 @@ Env vars required (see .env.example):
 """
 
 import logging
+from pathlib import Path
 from datetime import time as dt_time, timedelta
 
 from telegram import (
@@ -115,7 +116,7 @@ from fishing_game import (
     start_cast,
 )
 from streak_store import get_streak, get_users_at_risk, init_streak_db, record_play
-from tz_utils import SGT
+from tz_utils import SGT, today_sgt
 from yap_store import (
     clear_active_thread,
     get_active_thread_id,
@@ -124,6 +125,31 @@ from yap_store import (
     get_thread,
     init_yap_db,
     set_active_thread,
+)
+from rank_system import RANK_THRESHOLDS, get_rank, get_rank_image_filename
+from trivia_source import init_trivia_cache_db, DIFFICULTY_LABELS
+from daily_trivia import (
+    DAILY_TRIVIA_POINTS,
+    GAME_NAME as DAILY_TRIVIA_GAME_NAME,
+    get_or_create_todays_question,
+    get_todays_state,
+    init_daily_trivia_db,
+    submit_answer as submit_daily_trivia_answer,
+)
+from trivia_1v1 import (
+    DIFFICULTY_POINTS as TRIVIA_1V1_DIFFICULTY_POINTS,
+    GAME_NAME as TRIVIA_1V1_GAME_NAME,
+    MAX_QUESTIONS_PER_HOUR as TRIVIA_1V1_MAX_PER_HOUR,
+    ROUND_DURATION_HOURS as TRIVIA_1V1_ROUND_HOURS,
+    accept_challenge as accept_1v1_challenge,
+    create_challenge as create_1v1_challenge,
+    finalize_expired_matches,
+    get_active_match_for_user,
+    get_match_score,
+    get_open_challenges,
+    init_trivia_1v1_db,
+    start_next_question as start_1v1_question,
+    submit_1v1_answer,
 )
 from wordle_game import (
     GAME_NAME as WORDLE_GAME_NAME,
@@ -141,6 +167,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+RANKS_MEDIA_DIR = Path(__file__).parent / "media" / "ranks"
 
 
 # ---------- Persistent bottom keyboard ----------
@@ -190,8 +218,11 @@ def games_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🟩 Wordle", callback_data="game:wordle")],
             [InlineKeyboardButton("🎣 Fishing", callback_data="game:fishing")],
+            [InlineKeyboardButton("🧠 Daily Trivia", callback_data="game:daily_trivia")],
+            [InlineKeyboardButton("⚔️ 1v1 Trivia", callback_data="game:trivia_1v1_menu")],
             [InlineKeyboardButton("🏆 All-Time Leaderboard", callback_data="game:leaderboard")],
             [InlineKeyboardButton("📅 This Week's Leaderboard", callback_data="game:weekly_leaderboard")],
+            [InlineKeyboardButton("🎖️ My Rank", callback_data="game:my_rank")],
         ]
     )
 
@@ -918,7 +949,54 @@ async def mypoints_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if streak and streak["current_streak"] > 0:
         lines.append(f"\n🔥 Streak: {streak['current_streak']} day(s) (best: {streak['longest_streak']})")
 
+    rank = get_rank(total)
+    lines.append(f"\n{rank['label']}")
+    if rank["points_to_next"] is not None:
+        lines.append(f"({rank['points_to_next']} points to next rank)")
+
     await update.message.reply_text("\n".join(lines))
+
+
+async def _send_rank(user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """
+    Shared helper: sends the user's current rank, with the matching tier
+    image attached. Used by both /rank (a real command) and the Games-menu
+    "My Rank" button (a callback query) — chat_id passed explicitly so it
+    works correctly from either context, same pattern as the trivia helper.
+    """
+    identity = get_identity(user_id)
+    if identity is None:
+        await context.bot.send_message(chat_id=chat_id, text="You haven't set up a username yet. Send /setusername to get started!")
+        return
+
+    total = get_global_total(user_id)
+    rank = get_rank(total)
+
+    caption = f"{format_identity_tag(identity)}\n\n{rank['label']}\nTotal points: {total}"
+    if rank["points_to_next"] is not None:
+        caption += f"\n{rank['points_to_next']} points to {_next_rank_label(rank)}"
+
+    image_filename = get_rank_image_filename(rank["tier"])
+    image_path = RANKS_MEDIA_DIR / image_filename
+
+    try:
+        with open(image_path, "rb") as f:
+            await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+    except FileNotFoundError:
+        logger.warning("Rank image not found: %s", image_path)
+        await context.bot.send_message(chat_id=chat_id, text=caption)
+
+
+def _next_rank_label(rank: dict) -> str:
+    """Small helper to phrase the 'next rank' line readably."""
+    for tier, sublevel, min_points in RANK_THRESHOLDS:
+        if min_points == rank["next_threshold"]:
+            return f"{tier} {sublevel}"
+    return "the next rank"
+
+
+async def rank_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_rank(update.effective_user.id, context, chat_id=update.effective_chat.id)
 
 
 def _format_leaderboard(rows, title: str) -> str:
@@ -930,14 +1008,15 @@ def _format_leaderboard(rows, title: str) -> str:
     for i, row in enumerate(rows):
         prefix = medals[i] if i < len(medals) else f"{i + 1}."
         has_breakdown = "wordle_points" in row.keys()
+        total = row["total"] if "total" in row.keys() else row["points"]
+        rank = get_rank(total)
         if has_breakdown:
             lines.append(
-                f"{prefix} {row['avatar']} {row['username']} — "
-                f"Total: {row['total']} | 🟩 Wordle: {row['wordle_points']} | 🎣 Fishing: {row['fishing_points']}"
+                f"{prefix} {row['avatar']} {row['username']} — {rank['label']}\n"
+                f"     Total: {total} | 🟩 Wordle: {row['wordle_points']} | 🎣 Fishing: {row['fishing_points']}"
             )
         else:
-            points = row["total"] if "total" in row.keys() else row["points"]
-            lines.append(f"{prefix} {row['avatar']} {row['username']} — {points} pts")
+            lines.append(f"{prefix} {row['avatar']} {row['username']} — {rank['label']} ({total} pts)")
     return "\n".join(lines)
 
 
@@ -992,6 +1071,26 @@ async def games_menu_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":", 1)[1]
+
+    if choice == "daily_trivia":
+        await query.edit_message_text("Loading today's trivia...")
+        await _send_daily_trivia_question(update.effective_user.id, context, chat_id=update.effective_chat.id)
+        return
+
+    if choice == "trivia_1v1_menu":
+        await query.edit_message_text(
+            f"⚔️ 1v1 Trivia\n\n"
+            f"Challenge runs for {TRIVIA_1V1_ROUND_HOURS} hours. Answer up to "
+            f"{TRIVIA_1V1_MAX_PER_HOUR} questions per hour — most weighted points wins!\n"
+            f"🟢 Easy = {TRIVIA_1V1_DIFFICULTY_POINTS['easy']}pts · 🟡 Medium = {TRIVIA_1V1_DIFFICULTY_POINTS['medium']}pts · 🔴 Hard = {TRIVIA_1V1_DIFFICULTY_POINTS['hard']}pts\n\n"
+            f"Send /trivia1v1 to start or check your match."
+        )
+        return
+
+    if choice == "my_rank":
+        await query.edit_message_text("Loading your rank...")
+        await _send_rank(update.effective_user.id, context, chat_id=update.effective_chat.id)
+        return
 
     if choice == "leaderboard":
         rows = get_global_leaderboard(limit=20)
@@ -1210,6 +1309,211 @@ async def _handle_wordle_guess(update: Update, context: ContextTypes.DEFAULT_TYP
         guesses_left = MAX_GUESSES - result["guesses_used"]
         lines.append(f"\n{guesses_left} guess(es) left. Send your next guess!")
         await update.message.reply_text("\n".join(lines))
+
+
+async def _send_daily_trivia_question(user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    """
+    Shared helper: sends today's trivia question (or the "already answered"
+    status) to chat_id. Used by both /trivia (a real command, has
+    update.message) and the Games-menu button (a callback query, where
+    update.message is None — chat_id is passed explicitly instead so this
+    works correctly from either context).
+    """
+    identity = get_identity(user_id)
+    if identity is None:
+        await context.bot.send_message(chat_id=chat_id, text="You'll need a username first. Send /setusername to set one up!")
+        return
+
+    today_str = today_sgt().isoformat()
+
+    try:
+        q_state = get_or_create_todays_question(user_id, today_str)
+    except RuntimeError:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Couldn't fetch today's trivia question right now — please try again in a moment.",
+        )
+        return
+
+    if q_state["answered"]:
+        result_line = "✅ Correct!" if q_state["was_correct"] else f"❌ Incorrect (it was: {q_state['correct_answer']})"
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"You've already answered today's trivia.\n{result_line}\n\nCome back tomorrow for a new one!",
+        )
+        return
+
+    options = q_state["options"].split("|||")
+    difficulty_label = DIFFICULTY_LABELS.get(q_state["difficulty"], q_state["difficulty"])
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(opt, callback_data=f"trivia_answer:{opt}")] for opt in options]
+    )
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"🧠 Daily Trivia — {difficulty_label}\n\n{q_state['question']}",
+        reply_markup=keyboard,
+    )
+
+
+async def trivia_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _send_daily_trivia_question(update.effective_user.id, context, chat_id=update.effective_chat.id)
+
+
+async def trivia_answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    chosen = query.data.split(":", 1)[1]
+    user = update.effective_user
+    today_str = today_sgt().isoformat()
+
+    result = submit_daily_trivia_answer(user.id, today_str, chosen)
+    if not result["ok"]:
+        await query.edit_message_text(result["error"])
+        return
+
+    if result["correct"]:
+        new_total = award_points(user.id, DAILY_TRIVIA_GAME_NAME, result["points_awarded"])
+        streak_result = record_play(user.id)
+        text = (
+            f"✅ Correct! +{result['points_awarded']} points (total: {new_total})\n"
+            f"🔥 {streak_result['current_streak']}-day streak!"
+        )
+        if streak_result["milestone_hit"]:
+            bonus = streak_result["bonus_points"]
+            award_points(user.id, DAILY_TRIVIA_GAME_NAME, bonus)
+            text += f"\n🎊 {streak_result['milestone_hit']}-day milestone! +{bonus} bonus points!"
+    else:
+        text = f"❌ Not quite — the correct answer was: {result['correct_answer']}\n\nCome back tomorrow for a new one!"
+
+    await query.edit_message_text(text)
+
+
+async def trivia1v1_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /trivia1v1 — shows current match status if in one, otherwise offers to
+    start a new challenge (random matchmaking or join an open one).
+    """
+    user = update.effective_user
+    identity = get_identity(user.id)
+    if identity is None:
+        await update.message.reply_text("You'll need a username first. Send /setusername to set one up!")
+        return
+
+    finalize_expired_matches()  # lazily settle any matches that just expired
+
+    active = get_active_match_for_user(user.id)
+    if active is not None:
+        opponent_id = active["player_b_id"] if active["player_a_id"] == user.id else active["player_a_id"]
+        opponent_identity = get_identity(opponent_id)
+        opponent_name = opponent_identity["username"] if opponent_identity else "your opponent"
+
+        my_score = get_match_score(active["match_id"], user.id)
+        their_score = get_match_score(active["match_id"], opponent_id)
+
+        await update.message.reply_text(
+            f"⚔️ Active match vs {opponent_name}\n\n"
+            f"Your score: {my_score}\nTheir score: {their_score}\n\n"
+            f"Ends: {active['ends_at']}\n\n"
+            f"Send /trivia1v1answer to get your next question "
+            f"(up to {TRIVIA_1V1_MAX_PER_HOUR} per hour)."
+        )
+        return
+
+    open_matches = get_open_challenges(exclude_user_id=user.id)
+    if open_matches:
+        lines = ["⚔️ Open challenges waiting for an opponent:\n"]
+        keyboard_rows = []
+        for m in open_matches:
+            challenger = get_identity(m["player_a_id"])
+            name = challenger["username"] if challenger else "Someone"
+            lines.append(f"- vs {name}")
+            keyboard_rows.append([InlineKeyboardButton(f"Join vs {name}", callback_data=f"trivia1v1_join:{m['match_id']}")])
+        keyboard_rows.append([InlineKeyboardButton("🎲 Start a new open challenge instead", callback_data="trivia1v1_new")])
+        await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard_rows))
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🎲 Start an open challenge (random matchmaking)", callback_data="trivia1v1_new")]]
+    )
+    await update.message.reply_text(
+        f"⚔️ 1v1 Trivia\n\n"
+        f"Challenge runs for {TRIVIA_1V1_ROUND_HOURS} hours. Answer up to "
+        f"{TRIVIA_1V1_MAX_PER_HOUR} questions per hour — most weighted points wins!\n"
+        f"🟢 Easy = {TRIVIA_1V1_DIFFICULTY_POINTS['easy']}pts · 🟡 Medium = {TRIVIA_1V1_DIFFICULTY_POINTS['medium']}pts · 🔴 Hard = {TRIVIA_1V1_DIFFICULTY_POINTS['hard']}pts",
+        reply_markup=keyboard,
+    )
+
+
+async def trivia1v1_button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+
+    if query.data == "trivia1v1_new":
+        match_id = create_1v1_challenge(user.id, None)
+        await query.edit_message_text(
+            "🎲 Open challenge created! Waiting for someone to join — "
+            "anyone who runs /trivia1v1 will see it. You'll start once they accept."
+        )
+        return
+
+    if query.data.startswith("trivia1v1_join:"):
+        match_id = int(query.data.split(":", 1)[1])
+        success = accept_1v1_challenge(match_id, user.id)
+        if not success:
+            await query.edit_message_text("That challenge isn't available anymore — try /trivia1v1 again.")
+            return
+        await query.edit_message_text(
+            "⚔️ Challenge accepted! Send /trivia1v1answer to get your first question."
+        )
+
+
+async def trivia1v1_answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetches (or re-shows) the player's current pending question in their active match."""
+    user = update.effective_user
+    active = get_active_match_for_user(user.id)
+    if active is None:
+        await update.message.reply_text("You don't have an active 1v1 match. Send /trivia1v1 to start one!")
+        return
+
+    result = start_1v1_question(active["match_id"], user.id)
+    if not result["ok"]:
+        await update.message.reply_text(result["error"])
+        return
+
+    difficulty_label = DIFFICULTY_LABELS.get(result["difficulty"], result["difficulty"])
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(opt, callback_data=f"trivia1v1_answer:{active['match_id']}:{opt}")] for opt in result["options"]]
+    )
+    await update.message.reply_text(
+        f"⚔️ {difficulty_label}\n\n{result['question']}",
+        reply_markup=keyboard,
+    )
+
+
+async def trivia1v1_answer_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    _, match_id_str, chosen = query.data.split(":", 2)
+    match_id = int(match_id_str)
+    user = update.effective_user
+
+    result = submit_1v1_answer(match_id, user.id, chosen)
+    if not result["ok"]:
+        await query.edit_message_text(result["error"])
+        return
+
+    if result["correct"]:
+        award_points(user.id, TRIVIA_1V1_GAME_NAME, result["points_awarded"])
+        text = f"✅ Correct! +{result['points_awarded']} points this round.\n\nSend /trivia1v1answer for your next question."
+    else:
+        text = f"❌ Not quite — the answer was: {result['correct_answer']}\n\nSend /trivia1v1answer to keep going."
+
+    await query.edit_message_text(text)
 
 
 async def fish_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1645,6 +1949,50 @@ async def settle_reaction_points_job(context: ContextTypes.DEFAULT_TYPE) -> None
         mark_points_settled(confession["message_id"])
 
 
+async def finalize_1v1_matches_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Periodic job: finds any 1v1 trivia matches whose 24h window has
+    passed, settles them (winner/tie), awards a modest bonus to the
+    winner, and DMs both players the result. Without this job, an
+    expired match would otherwise only get finalized lazily the next
+    time either player happens to check /trivia1v1 — which could be
+    never, leaving the match stuck in limbo and neither player notified.
+    """
+    finalized = finalize_expired_matches()
+
+    WINNER_BONUS = 25  # small extra incentive on top of the per-question points already earned
+
+    for match in finalized:
+        player_a_identity = get_identity(match["player_a_id"])
+        player_b_identity = get_identity(match["player_b_id"]) if match["player_b_id"] else None
+
+        name_a = player_a_identity["username"] if player_a_identity else "Player A"
+        name_b = player_b_identity["username"] if player_b_identity else "Player B"
+
+        if match["winner_id"] is None:
+            result_text_a = f"⚔️ Your 1v1 trivia match vs {name_b} ended in a TIE!\nFinal score: {match['score_a']} - {match['score_b']}"
+            result_text_b = f"⚔️ Your 1v1 trivia match vs {name_a} ended in a TIE!\nFinal score: {match['score_b']} - {match['score_a']}"
+        elif match["winner_id"] == match["player_a_id"]:
+            award_points(match["player_a_id"], TRIVIA_1V1_GAME_NAME, WINNER_BONUS)
+            result_text_a = f"🎉 You WON your 1v1 trivia match vs {name_b}!\nFinal score: {match['score_a']} - {match['score_b']}\n+{WINNER_BONUS} bonus points!"
+            result_text_b = f"⚔️ Your 1v1 trivia match vs {name_a} ended.\nFinal score: {match['score_b']} - {match['score_a']}\nBetter luck next time!"
+        else:
+            award_points(match["player_b_id"], TRIVIA_1V1_GAME_NAME, WINNER_BONUS)
+            result_text_a = f"⚔️ Your 1v1 trivia match vs {name_b} ended.\nFinal score: {match['score_a']} - {match['score_b']}\nBetter luck next time!"
+            result_text_b = f"🎉 You WON your 1v1 trivia match vs {name_a}!\nFinal score: {match['score_b']} - {match['score_a']}\n+{WINNER_BONUS} bonus points!"
+
+        try:
+            await context.bot.send_message(chat_id=match["player_a_id"], text=result_text_a)
+        except Exception:
+            logger.warning("Couldn't notify player_a (%s) of 1v1 match result", match["player_a_id"])
+
+        if match["player_b_id"]:
+            try:
+                await context.bot.send_message(chat_id=match["player_b_id"], text=result_text_b)
+            except Exception:
+                logger.warning("Couldn't notify player_b (%s) of 1v1 match result", match["player_b_id"])
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Update %s caused error %s", update, context.error, exc_info=context.error)
 
@@ -1661,6 +2009,9 @@ def build_application() -> Application:
     init_reports_db()
     init_badges_db()
     init_yap_db()
+    init_trivia_cache_db()
+    init_daily_trivia_db()
+    init_trivia_1v1_db()
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
@@ -1715,6 +2066,13 @@ def build_application() -> Application:
 
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_GAMES}$"), games_button))
     app.add_handler(MessageHandler(filters.Regex(f"^{BTN_MYPOINTS}$"), mypoints_button))
+    app.add_handler(CommandHandler("rank", rank_command))
+    app.add_handler(CommandHandler("trivia", trivia_command))
+    app.add_handler(CallbackQueryHandler(trivia_answer_callback, pattern=r"^trivia_answer:"))
+    app.add_handler(CommandHandler("trivia1v1", trivia1v1_command))
+    app.add_handler(CallbackQueryHandler(trivia1v1_button_callback, pattern=r"^trivia1v1_(new|join:)"))
+    app.add_handler(CommandHandler("trivia1v1answer", trivia1v1_answer_command))
+    app.add_handler(CallbackQueryHandler(trivia1v1_answer_callback, pattern=r"^trivia1v1_answer:"))
     app.add_handler(CommandHandler("fish", fish_command))
     app.add_handler(CommandHandler("reel", reel_command))
     app.add_handler(CommandHandler("tank", tank_command))
@@ -1777,10 +2135,11 @@ def build_application() -> Application:
 
     # Streak warning — 10:30pm Singapore time, shortly before the SGT
     # midnight cutoff used by Wordle/streaks.
-    app.job_queue.run_daily(
+    streak_job = app.job_queue.run_daily(
         streak_warning_job,
         time=dt_time(hour=22, minute=30, tzinfo=SGT),
     )
+    logger.info("Scheduled streak_warning_job: %s", streak_job)
 
     # Reaction-points settlement — checks every 10 minutes for confessions
     # that have crossed the 1-hour mark and haven't been paid out yet.
@@ -1788,6 +2147,16 @@ def build_application() -> Application:
         settle_reaction_points_job,
         interval=timedelta(minutes=10),
         first=timedelta(seconds=30),
+    )
+
+    # 1v1 trivia match finalization — checks every 10 minutes for matches
+    # whose 24h window has passed, settles winner/tie, and notifies both
+    # players. Without this, a match would only get finalized whenever
+    # either player happened to next check /trivia1v1, possibly never.
+    app.job_queue.run_repeating(
+        finalize_1v1_matches_job,
+        interval=timedelta(minutes=10),
+        first=timedelta(minutes=1),
     )
 
     # Daily leaderboard — posts this week's standings to the channel once

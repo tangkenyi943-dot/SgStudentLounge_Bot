@@ -2,3 +2,4 @@ python-telegram-bot[webhooks,job-queue]==22.8
 python-dotenv==1.0.1
 english-words==2.0.2
 better-profanity==0.7.0
+requests==2.33.1
