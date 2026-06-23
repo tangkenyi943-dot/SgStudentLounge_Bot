@@ -72,3 +72,8 @@ def get_rank(total_points: int) -> dict:
 def get_rank_image_filename(tier: str) -> str:
     """Returns the filename (not full path) of the pixel-art image for a tier."""
     return f"rank_{tier.lower()}.png"
+
+
+def get_rank_sticker_filename(tier: str) -> str:
+    """Returns the filename of the sticker-format (512px, transparent) version."""
+    return f"rank_{tier.lower()}_sticker.png"

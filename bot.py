@@ -126,7 +126,7 @@ from yap_store import (
     init_yap_db,
     set_active_thread,
 )
-from rank_system import RANK_THRESHOLDS, get_rank, get_rank_image_filename
+from rank_system import RANK_THRESHOLDS, get_rank, get_rank_sticker_filename
 from trivia_source import init_trivia_cache_db, DIFFICULTY_LABELS
 from daily_trivia import (
     DAILY_TRIVIA_POINTS,
@@ -959,10 +959,13 @@ async def mypoints_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def _send_rank(user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
     """
-    Shared helper: sends the user's current rank, with the matching tier
-    image attached. Used by both /rank (a real command) and the Games-menu
-    "My Rank" button (a callback query) — chat_id passed explicitly so it
-    works correctly from either context, same pattern as the trivia helper.
+    Shared helper: sends the user's current rank as a small sticker
+    (matching the tier), followed by a separate text message with the
+    actual rank/points details. Stickers can't carry a caption — that's
+    why this is two messages instead of one photo-with-caption. Used by
+    both /rank (a real command) and the Games-menu "My Rank" button (a
+    callback query) — chat_id passed explicitly so it works correctly
+    from either context, same pattern as the trivia helper.
     """
     identity = get_identity(user_id)
     if identity is None:
@@ -972,19 +975,22 @@ async def _send_rank(user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: 
     total = get_global_total(user_id)
     rank = get_rank(total)
 
-    caption = f"{format_identity_tag(identity)}\n\n{rank['label']}\nTotal points: {total}"
-    if rank["points_to_next"] is not None:
-        caption += f"\n{rank['points_to_next']} points to {_next_rank_label(rank)}"
-
-    image_filename = get_rank_image_filename(rank["tier"])
-    image_path = RANKS_MEDIA_DIR / image_filename
+    sticker_filename = get_rank_sticker_filename(rank["tier"])
+    sticker_path = RANKS_MEDIA_DIR / sticker_filename
 
     try:
-        with open(image_path, "rb") as f:
-            await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+        with open(sticker_path, "rb") as f:
+            await context.bot.send_sticker(chat_id=chat_id, sticker=f)
     except FileNotFoundError:
-        logger.warning("Rank image not found: %s", image_path)
-        await context.bot.send_message(chat_id=chat_id, text=caption)
+        logger.warning("Rank sticker not found: %s", sticker_path)
+    except Exception:
+        logger.exception("Failed to send rank sticker, continuing with text only")
+
+    text = f"{format_identity_tag(identity)}\n\n{rank['label']}\nTotal points: {total}"
+    if rank["points_to_next"] is not None:
+        text += f"\n{rank['points_to_next']} points to {_next_rank_label(rank)}"
+
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 def _next_rank_label(rank: dict) -> str:
